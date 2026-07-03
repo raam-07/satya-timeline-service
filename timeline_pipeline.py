@@ -128,6 +128,79 @@ def slugify(text):
     text = re.sub(r'[\s-]+', '-', text)
     return text
 
+def run_write_burst_with_reconnect(conn, write_func, *args, **kwargs):
+    max_attempts = 2
+    for attempt in range(max_attempts):
+        try:
+            cursor = conn.cursor()
+            res = write_func(cursor, *args, **kwargs)
+            conn.commit()
+            return conn, res
+        except Exception as e:
+            logging.error(f"Database write attempt {attempt+1} failed: {e}")
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            if attempt < max_attempts - 1:
+                logging.info("Reconnecting database and retrying write burst...")
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+                conn = get_db_connection()
+            else:
+                raise e
+
+def do_attach_write(cursor, matched_event_id, art_id, milestone, scraped_at, new_centroid, new_count, merged_keys, event_title, event_slug):
+    cursor.execute("""
+        INSERT INTO event_articles (event_id, article_id, milestone, event_date)
+        VALUES (?, ?, ?, ?)
+    """, (matched_event_id, art_id, milestone, scraped_at))
+    
+    cursor.execute("""
+        UPDATE events 
+        SET centroid = ?, last_seen = ?, article_count = ?, entity_keys = ?, title = ?, slug = ?
+        WHERE id = ?
+    """, (
+        new_centroid.tobytes(),
+        scraped_at,
+        new_count,
+        json.dumps(merged_keys),
+        event_title,
+        event_slug,
+        matched_event_id
+    ))
+    
+    cursor.execute("INSERT OR REPLACE INTO timeline_checkpoint (id, last_article_id) VALUES (1, ?)", (art_id,))
+
+def do_create_write(cursor, art_id, art_entities, embedding, scraped_at):
+    cursor.execute("""
+        INSERT INTO events (title, slug, entity_keys, centroid, first_seen, last_seen, article_count, state)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    """, (
+        None,
+        None,
+        json.dumps(art_entities),
+        embedding.tobytes(),
+        scraped_at,
+        scraped_at,
+        1,
+        'open'
+    ))
+    new_ev_id = cursor.lastrowid
+    
+    cursor.execute("""
+        INSERT INTO event_articles (event_id, article_id, milestone, event_date)
+        VALUES (?, ?, ?, ?)
+    """, (new_ev_id, art_id, None, scraped_at))
+    
+    cursor.execute("INSERT OR REPLACE INTO timeline_checkpoint (id, last_article_id) VALUES (1, ?)", (art_id,))
+    return new_ev_id
+
+def do_checkpoint_write(cursor, art_id):
+    cursor.execute("INSERT OR REPLACE INTO timeline_checkpoint (id, last_article_id) VALUES (1, ?)", (art_id,))
+
 def main():
     parser = argparse.ArgumentParser(description="Satya Timeline Service Pipeline")
     parser.add_argument('--dry-run', action='store_true', help="Run in dry-run mode without writing to DB or invoking LLMs")
@@ -278,13 +351,11 @@ def main():
             best_sim = -1.0
 
             # Step 2: Filter candidates in memory
-            # Rules: share at least 1 entity key AND last_seen > scraped_at - 90 days
             cutoff_time = scraped_at - 90 * 24 * 3600
             for ev in open_events:
                 if ev['last_seen'] >= cutoff_time:
                     shared_keys = ev['entity_keys'].intersection(art_entities)
                     if shared_keys:
-                        # Compute similarity
                         sim = float(np.dot(ev['centroid'], embedding))
                         if sim > best_sim:
                             best_sim = sim
@@ -292,23 +363,39 @@ def main():
 
             logging.info(f"  Best similarity match: {best_sim:.4f} with Event ID {best_match['id'] if best_match else None}")
 
+            # Do all database read operations BEFORE starting any LLM calls
+            milestone_summary = "- None"
+            existing_milestones = []
+            if best_sim >= args.sim_threshold and best_match is not None:
+                if not args.dry_run:
+                    try:
+                        cursor.execute("""
+                            SELECT milestone, event_date FROM event_articles 
+                            WHERE event_id = ? 
+                            ORDER BY event_date DESC LIMIT 3
+                        """, (best_match['id'],))
+                        ms_rows = cursor.fetchall()
+                        recent_ms = [f"- {r[0]}" for r in ms_rows if r[0]]
+                        if recent_ms:
+                            milestone_summary = "\n".join(recent_ms)
+                        
+                        # If count is 1, adding the new article will make it 2, triggering title generation
+                        if best_match['article_count'] == 1:
+                            cursor.execute("""
+                                SELECT milestone FROM event_articles 
+                                WHERE event_id = ? 
+                                ORDER BY event_date ASC
+                            """, (best_match['id'],))
+                            existing_milestones = [r[0] for r in cursor.fetchall() if r[0]]
+                    except Exception as e:
+                        logging.error(f"Failed to pre-fetch milestones for candidate: {e}")
+
             matched_event = None
             if best_sim >= args.sim_threshold and best_match is not None:
-                # Similarity matches threshold. Let's do the 9B attach gate check
                 if args.dry_run:
                     logging.info(f"  [DRY-RUN] Simulating Gemma 9B attach gate approval for Event ID {best_match['id']} (sim: {best_sim:.4f})")
                     matched_event = best_match
                 else:
-                    # Fetch last 3 milestones
-                    cursor.execute("""
-                        SELECT milestone, event_date FROM event_articles 
-                        WHERE event_id = ? 
-                        ORDER BY event_date DESC LIMIT 3
-                    """, (best_match['id'],))
-                    ms_rows = cursor.fetchall()
-                    recent_ms = [f"- {r[0]}" for r in ms_rows if r[0]]
-                    milestone_summary = "\n".join(recent_ms) if recent_ms else "- None"
-
                     event_name = best_match['title'] or "Untitled Event"
 
                     # Format Prompt
@@ -320,7 +407,7 @@ def main():
                         new_summary=decompressed_article[:800]
                     )
 
-                    # Invoke Gemma 9B
+                    # Invoke Gemma 9B (Gate)
                     output = llm_9b(prompt, max_tokens=150, stop=["<end_of_turn>"], temperature=0.0)
                     response_text = output['choices'][0]['text'].strip()
                     logging.info(f"  Gemma 9B Response: {response_text}")
@@ -373,80 +460,63 @@ def main():
                     else:
                         logging.info(f"  Milestone validation failed (length={len(words)}, text='{gen_milestone}'). Fallback to NULL.")
 
-                    # Write to database (transactional execution per article)
-                    try:
-                        # 1. Insert event article mapping
-                        cursor.execute("""
-                            INSERT INTO event_articles (event_id, article_id, milestone, event_date)
-                            VALUES (?, ?, ?, ?)
-                        """, (matched_event['id'], art_id, milestone, scraped_at))
+                    # Calculate EMA centroid and new count
+                    new_centroid = 0.7 * matched_event['centroid'] + 0.3 * embedding
+                    new_centroid_norm = np.linalg.norm(new_centroid)
+                    if new_centroid_norm > 0:
+                        new_centroid = new_centroid / new_centroid_norm
 
-                        # 2. Compute EMA centroid (0.7 * old + 0.3 * new)
-                        new_centroid = 0.7 * matched_event['centroid'] + 0.3 * embedding
-                        new_centroid_norm = np.linalg.norm(new_centroid)
-                        if new_centroid_norm > 0:
-                            new_centroid = new_centroid / new_centroid_norm
+                    new_count = matched_event['article_count'] + 1
+                    merged_keys = list(matched_event['entity_keys'].union(art_entities))
 
-                        new_count = matched_event['article_count'] + 1
-                        merged_keys = list(matched_event['entity_keys'].union(art_entities))
-
-                        # If count hits 2, generate Title using Gemma 9B
-                        event_title = matched_event['title']
-                        event_slug = None
-                        if new_count >= 2 and not matched_event['title']:
-                            # Get both milestones/titles
-                            cursor.execute("SELECT milestone, event_date FROM event_articles WHERE event_id = ? ORDER BY event_date ASC", (matched_event['id'],))
-                            all_ms = [r[0] for r in cursor.fetchall() if r[0]]
-                            if not all_ms:
-                                all_ms = [reph_title]
-                            
-                            title_prompt = title_prompt_template.format(milestones="\n".join(f"- {m}" for m in all_ms))
-                            title_out = llm_9b(title_prompt, max_tokens=60, stop=["<end_of_turn>"], temperature=0.0)
-                            gen_title = title_out['choices'][0]['text'].strip().strip('"').strip("'")
-                            
-                            # Validate title length
-                            if len(gen_title.split()) <= 8:
-                                event_title = gen_title
-                                event_slug = slugify(event_title)
-                                logging.info(f"  Generated Event Title: '{event_title}' | slug: {event_slug}")
-                            else:
-                                logging.error(f"  Generated Title too long ({len(gen_title.split())} words): '{gen_title}'. Keeping NULL.")
-
-                        # Update event in DB
-                        cursor.execute("""
-                            UPDATE events 
-                            SET centroid = ?, last_seen = ?, article_count = ?, entity_keys = ?, title = ?, slug = ?
-                            WHERE id = ?
-                        """, (
-                            new_centroid.tobytes(),
-                            scraped_at,
-                            new_count,
-                            json.dumps(merged_keys),
-                            event_title,
-                            event_slug,
-                            matched_event['id']
-                        ))
-
-                        # Update checkpoint
-                        cursor.execute("INSERT OR REPLACE INTO timeline_checkpoint (id, last_article_id) VALUES (1, ?)", (art_id,))
+                    # If count hits 2, generate Title using Gemma 9B
+                    event_title = matched_event['title']
+                    event_slug = None
+                    if new_count >= 2 and not matched_event['title']:
+                        all_ms = list(existing_milestones)
+                        if milestone:
+                            all_ms.append(milestone)
+                        if not all_ms:
+                            all_ms = [reph_title]
                         
-                        conn.commit()
-
-                        # Update memory cache
-                        matched_event['centroid'] = new_centroid
-                        matched_event['last_seen'] = scraped_at
-                        matched_event['article_count'] = new_count
-                        matched_event['entity_keys'] = set(merged_keys)
-                        matched_event['title'] = event_title
+                        title_prompt = title_prompt_template.format(milestones="\n".join(f"- {m}" for m in all_ms))
+                        title_out = llm_9b(title_prompt, max_tokens=60, stop=["<end_of_turn>"], temperature=0.0)
+                        gen_title = title_out['choices'][0]['text'].strip().strip('"').strip("'")
                         
-                        attached_count += 1
-                        logging.info(f"  Attached to Event ID {matched_event['id']} successfully.")
+                        # Validate title length
+                        if len(gen_title.split()) <= 8:
+                            event_title = gen_title
+                            event_slug = slugify(event_title)
+                            logging.info(f"  Generated Event Title: '{event_title}' | slug: {event_slug}")
+                        else:
+                            logging.error(f"  Generated Title too long ({len(gen_title.split())} words): '{gen_title}'. Keeping NULL.")
 
-                    except Exception as db_err:
-                        conn.rollback()
-                        logging.critical(f"Database write transaction aborted: {db_err}")
-                        conn.close()
-                        sys.exit(1)
+                    # Write to database (transactional execution per article using hot reconnect wrapper)
+                    conn, _ = run_write_burst_with_reconnect(
+                        conn,
+                        do_attach_write,
+                        matched_event['id'],
+                        art_id,
+                        milestone,
+                        scraped_at,
+                        new_centroid,
+                        new_count,
+                        merged_keys,
+                        event_title,
+                        event_slug
+                    )
+                    # Refresh cursor after reconnect/retry block in case it reconnected
+                    cursor = conn.cursor()
+
+                    # Update memory cache
+                    matched_event['centroid'] = new_centroid
+                    matched_event['last_seen'] = scraped_at
+                    matched_event['article_count'] = new_count
+                    matched_event['entity_keys'] = set(merged_keys)
+                    matched_event['title'] = event_title
+                    
+                    attached_count += 1
+                    logging.info(f"  Attached to Event ID {matched_event['id']} successfully.")
             else:
                 # CREATE NEW EVENT
                 if args.dry_run:
@@ -462,61 +532,41 @@ def main():
                     attached_count += 1
                     logging.info(f"  [DRY-RUN] Simulated create new Event ID {new_ev_id}.")
                 else:
-                    try:
-                        # Write to database (transactional execution per article)
-                        cursor.execute("""
-                            INSERT INTO events (title, slug, entity_keys, centroid, first_seen, last_seen, article_count, state)
-                            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                        """, (
-                            None,  # title (NULL until 2nd article)
-                            None,  # slug
-                            json.dumps(art_entities),
-                            embedding.tobytes(),
-                            scraped_at,
-                            scraped_at,
-                            1,
-                            'open'
-                        ))
-                        new_ev_id = cursor.lastrowid
+                    # Write to database (transactional execution per article using hot reconnect wrapper)
+                    conn, new_ev_id = run_write_burst_with_reconnect(
+                        conn,
+                        do_create_write,
+                        art_id,
+                        art_entities,
+                        embedding,
+                        scraped_at
+                    )
+                    cursor = conn.cursor()
 
-                        # Insert event article mapping
-                        cursor.execute("""
-                            INSERT INTO event_articles (event_id, article_id, milestone, event_date)
-                            VALUES (?, ?, ?, ?)
-                        """, (new_ev_id, art_id, None, scraped_at))
-
-                        # Update checkpoint
-                        cursor.execute("INSERT OR REPLACE INTO timeline_checkpoint (id, last_article_id) VALUES (1, ?)", (art_id,))
-
-                        conn.commit()
-
-                        # Update memory cache
-                        open_events.append({
-                            'id': new_ev_id,
-                            'title': None,
-                            'entity_keys': set(art_entities),
-                            'centroid': embedding,
-                            'last_seen': scraped_at,
-                            'article_count': 1
-                        })
-                        attached_count += 1
-                        logging.info(f"  Created new invisible Event ID {new_ev_id}.")
-
-                    except Exception as db_err:
-                        conn.rollback()
-                        logging.critical(f"Database write transaction aborted: {db_err}")
-                        conn.close()
-                        sys.exit(1)
+                    # Update memory cache
+                    open_events.append({
+                        'id': new_ev_id,
+                        'title': None,
+                        'entity_keys': set(art_entities),
+                        'centroid': embedding,
+                        'last_seen': scraped_at,
+                        'article_count': 1
+                    })
+                    attached_count += 1
+                    logging.info(f"  Created new invisible Event ID {new_ev_id}.")
 
         except Exception as err:
             # Poison pill guard: skip this article, advance cursor, and continue
             logging.error(f"Poison-pill encountered for article ID {art_id}: {err}")
             if not args.dry_run:
                 try:
-                    cursor.execute("INSERT OR REPLACE INTO timeline_checkpoint (id, last_article_id) VALUES (1, ?)", (art_id,))
-                    conn.commit()
+                    conn, _ = run_write_burst_with_reconnect(
+                        conn,
+                        do_checkpoint_write,
+                        art_id
+                    )
+                    cursor = conn.cursor()
                 except Exception as commit_err:
-                    conn.rollback()
                     logging.critical(f"Failed to advance cursor after poison-pill: {commit_err}")
                     conn.close()
                     sys.exit(1)
@@ -527,42 +577,66 @@ def main():
     if not args.dry_run and max_scraped_at > 0:
         dormancy_cutoff = max_scraped_at - 90 * 24 * 3600
         logging.info(f"\nRunning dormancy sweep relative to logical clock cutoff: {dormancy_cutoff}...")
-        try:
-            cursor.execute("""
-                UPDATE events 
-                SET state = 'dormant' 
-                WHERE state = 'open' AND last_seen < ?
-            """, (dormancy_cutoff,))
-            dormant_count = cursor.rowcount
-            conn.commit()
-            logging.info(f"Dormancy sweep completed. Marked {dormant_count} events as dormant.")
-        except Exception as e:
-            conn.rollback()
-            logging.error(f"Failed to execute dormancy sweep: {e}")
+        for attempt in range(2):
+            try:
+                cursor = conn.cursor()
+                cursor.execute("""
+                    UPDATE events 
+                    SET state = 'dormant' 
+                    WHERE state = 'open' AND last_seen < ?
+                """, (dormancy_cutoff,))
+                dormant_count = cursor.rowcount
+                conn.commit()
+                logging.info(f"Dormancy sweep completed. Marked {dormant_count} events as dormant.")
+                break
+            except Exception as e:
+                logging.error(f"Failed to execute dormancy sweep (attempt {attempt+1}): {e}")
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+                if attempt == 0:
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+                    conn = get_db_connection()
 
-    # Check if there are more articles remaining in the table
+    # Check if there are more articles remaining in the table (with reconnect logic)
     has_more = "false"
-    try:
-        cursor.execute("""
-            SELECT id FROM articles 
-            WHERE id > ?
-              AND status IN ('classified','entity_processed','processed')
-              AND (category != 'international' 
-                   OR party_mentioned NOT IN ('[]','') 
-                   OR ministers_mentioned NOT IN ('[]','') 
-                   OR states_mentioned NOT IN ('[]','') 
-                   OR cities_mentioned NOT IN ('[]',''))
-              AND (ministers_mentioned != '[]' OR party_mentioned != '[]' OR civic_flag = 1)
-            LIMIT 1
-        """, (last_processed_id,))
-        row = cursor.fetchone()
-        if row:
-            has_more = "true"
-    except Exception as e:
-        logging.error(f"Failed to check for remaining articles: {e}")
+    for attempt in range(2):
+        try:
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT id FROM articles 
+                WHERE id > ?
+                  AND status IN ('classified','entity_processed','processed')
+                  AND (category != 'international' 
+                       OR party_mentioned NOT IN ('[]','') 
+                       OR ministers_mentioned NOT IN ('[]','') 
+                       OR states_mentioned NOT IN ('[]','') 
+                       OR cities_mentioned NOT IN ('[]',''))
+                  AND (ministers_mentioned != '[]' OR party_mentioned != '[]' OR civic_flag = 1)
+                LIMIT 1
+            """, (last_processed_id,))
+            row = cursor.fetchone()
+            if row:
+                has_more = "true"
+            break
+        except Exception as e:
+            logging.error(f"Failed to check for remaining articles (attempt {attempt+1}): {e}")
+            if attempt == 0:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+                conn = get_db_connection()
 
     # Close connection
-    conn.close()
+    try:
+        conn.close()
+    except Exception:
+        pass
 
     logging.info(f"Batch completed. attached={attached_count}, has_more={has_more}")
     
