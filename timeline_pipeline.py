@@ -196,9 +196,8 @@ def main():
 
     if not articles_rows:
         logging.info("No articles to process in this batch.")
-        if not args.dry_run:
-            print("::set-output name=has_more::false")
-            print("::set-output name=articles_attached::0")
+        print("has_more=false")
+        print("articles_attached=0")
         conn.close()
         sys.exit(0)
 
