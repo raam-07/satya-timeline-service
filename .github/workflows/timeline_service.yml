@@ -34,7 +34,7 @@ on:
         default: ''
 
 concurrency:
-  group: satya-timeline
+  group: satya-timeline-${{ github.event.inputs.audit_event_id || 'main' }}
   cancel-in-progress: false
 
 jobs:
