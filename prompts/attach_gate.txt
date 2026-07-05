@@ -16,13 +16,11 @@ SUMMARY: {new_summary}
 Does the new article fall within this event's scope?
 - ATTACH if it reports a development, reaction, analysis or consequence of the
   occurrence named in the scope — even if it differs from earlier developments.
-- REJECT if it is outside the scope: a different occurrence, a general roundup,
-  or other actions by the same people, parties or regions.
-- The article must be about the SPECIFIC occurrence named in the scope.
-  REJECT if it is about a different occurrence — even if it involves the same
-  people, the same session of Parliament, or similar economic and market themes.
-  (e.g. a trade deal is not the Union Budget, even if both move markets and
-  involve the Finance Minister.)
+- REJECT if ARTICLE DATE is earlier than EVENT BEGAN — an article cannot
+  belong to an event that had not yet begun.
+- If the article's headline names a different specific occurrence (a trade
+  deal, another state's budget, another court case), REJECT — shared
+  ministers, Parliament sessions, or market impact do not override this.
 - If in doubt, REJECT.
 
 Answer with one word: ATTACH or REJECT
