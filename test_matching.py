@@ -74,17 +74,17 @@ class TestTimelineService(unittest.TestCase):
         self.assertAlmostEqual(np.linalg.norm(v_normalized), 1.0)
 
     def test_logical_clock_dormancy(self):
-        # Verify 90 days logical clock threshold mapping
-        # 90 days = 90 * 24 * 3600 seconds = 7,776,000 seconds
+        # Verify 21 days logical clock threshold mapping
+        # 21 days = 21 * 24 * 3600 seconds = 1,814,400 seconds
         max_scraped_at = 1780000000
-        cutoff = max_scraped_at - 90 * 24 * 3600
+        cutoff = max_scraped_at - 21 * 24 * 3600
 
-        # Event last seen within 90 days (active)
-        last_seen_active = max_scraped_at - 45 * 24 * 3600
+        # Event last seen within 21 days (active)
+        last_seen_active = max_scraped_at - 10 * 24 * 3600
         self.assertTrue(last_seen_active >= cutoff)
 
-        # Event last seen more than 90 days ago (dormant)
-        last_seen_dormant = max_scraped_at - 95 * 24 * 3600
+        # Event last seen more than 21 days ago (dormant)
+        last_seen_dormant = max_scraped_at - 25 * 24 * 3600
         self.assertTrue(last_seen_dormant < cutoff)
 
     def test_merge_and_cap_keys(self):

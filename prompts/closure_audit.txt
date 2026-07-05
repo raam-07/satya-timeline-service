@@ -2,19 +2,16 @@
 You are auditing a news event archive before it is permanently sealed.
 
 EVENT TITLE: {event_title}
-THE STORY (first report): {founding_milestone}
+EVENT SCOPE: {scope}
 
 MEMBER ARTICLE: {article_title}
 ITS MILESTONE: {milestone}
 
-Is this article a development of THIS SPECIFIC STORY?
-KEEP only if unmistakably yes. If it is merely related, same-party politics,
-a different controversy, or a general roundup — EVICT.
-
-Examples of EVICT: a state government project launch is not the Union Budget;
-a politician's general remarks or self-defence is not the specific story;
-a state scheme announcement is not a national budget story — even if the same
-politicians appear in both.
+Does this article fall within the event's scope?
+KEEP if it is a development, reaction, analysis or consequence of the
+occurrence named in the scope. EVICT if it is outside the scope — a different
+occurrence, a general roundup, or other actions by the same people or regions.
+If in doubt, EVICT.
 
 Answer with one word: KEEP or EVICT
 <end_of_turn>

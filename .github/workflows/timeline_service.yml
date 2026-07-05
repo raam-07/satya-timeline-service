@@ -32,6 +32,11 @@ on:
         required: false
         type: string
         default: ''
+      run_eval:
+        description: 'Run evaluation harness'
+        required: false
+        type: boolean
+        default: false
 
 concurrency:
   group: satya-timeline-${{ github.event.inputs.audit_event_id || 'main' }}
@@ -120,7 +125,15 @@ jobs:
                   shutil.rmtree(temp_cache)
           '
 
+      - name: Run Evaluation Harness
+        if: ${{ github.event.inputs.run_eval == 'true' }}
+        env:
+          MODEL_9B_PATH: "./models/gemma-2-9b-it-Q6_K.gguf"
+        run: |
+          python run_eval.py
+
       - name: Run Timeline Pipeline
+        if: ${{ github.event.inputs.run_eval != 'true' }}
         id: run-pipeline
         env:
           SATYA_DB_URL: ${{ secrets.SATYA_DB_URL }}
@@ -153,9 +166,9 @@ jobs:
           echo "articles_attached=$ART_ATTACHED" >> $GITHUB_OUTPUT
           
           echo "GHA OUTPUT - has_more: $HAS_MORE, articles_attached: $ART_ATTACHED"
-
+ 
       - name: Trigger next Timeline run if remaining
-        if: steps.run-pipeline.outputs.has_more == 'true' && github.event.inputs.dry_run != 'true'
+        if: steps.run-pipeline.outputs.has_more == 'true' && github.event.inputs.dry_run != 'true' && github.event.inputs.run_eval != 'true'
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |

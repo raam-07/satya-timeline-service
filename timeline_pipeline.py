@@ -124,21 +124,45 @@ def assign_saga_id(cursor, ev1_id, ev2_id):
         cursor.execute("UPDATE events SET saga_id = ? WHERE saga_id = ?", (s1, s2))
         cursor.execute("UPDATE events SET saga_id = ? WHERE id = ?", (s1, ev2_id))
 
+def generate_event_scope(llm_9b, template, title, summary):
+    try:
+        prompt = template.format(
+            title=title or "Untitled Article",
+            summary=summary[:1200] if summary else "No Summary Available"
+        )
+        output = llm_9b(prompt, max_tokens=150, stop=["<end_of_turn>"], temperature=0.0)
+        scope = output['choices'][0]['text'].strip()
+        
+        if not scope:
+            return None
+        words = scope.split()
+        if len(words) > 80:
+            logging.warning(f"Scope too long ({len(words)} words): '{scope}'")
+            return None
+        if not scope.lower().startswith("this event covers"):
+            logging.warning(f"Scope does not start with 'This event covers': '{scope}'")
+            return None
+        return scope
+    except Exception as e:
+        logging.error(f"Error in generate_event_scope: {e}")
+        return None
+
 def check_saga_links_in_memory(cursor, llm_9b, event_id, event_title, merged_keys, first_seen, last_seen, saga_check_prompt_template):
     linked_ids = []
     t_keys = set(merged_keys)
     t_founding = get_founding_milestone(cursor, event_id)
     
-    # Query all closed events
-    cursor.execute("SELECT id, title, entity_keys, first_seen, last_seen, saga_id FROM events WHERE state = 'closed'")
-    closed_events = cursor.fetchall()
-    
-    # Fetch target current saga_id
-    cursor.execute("SELECT saga_id FROM events WHERE id = ?", (event_id,))
+    # Fetch target current saga_id and scope
+    cursor.execute("SELECT saga_id, scope FROM events WHERE id = ?", (event_id,))
     row = cursor.fetchone()
     t_saga = row[0] if row else None
+    t_scope = row[1] if row else None
     
-    for c_id, c_title, c_keys_json, c_first, c_last, c_saga in closed_events:
+    # Query all closed events
+    cursor.execute("SELECT id, title, entity_keys, first_seen, last_seen, saga_id, scope FROM events WHERE state = 'closed'")
+    closed_events = cursor.fetchall()
+    
+    for c_id, c_title, c_keys_json, c_first, c_last, c_saga, c_scope in closed_events:
         if c_id == event_id:
             continue
         if not c_title:
@@ -151,24 +175,28 @@ def check_saga_links_in_memory(cursor, llm_9b, event_id, event_title, merged_key
         if len(t_keys.intersection(c_keys)) >= 2:
             c_founding = get_founding_milestone(cursor, c_id)
             
+            # Determine scopes with fallbacks
+            c_scope_val = c_scope or c_founding
+            t_scope_val = t_scope or t_founding
+            
             def fmt_date(ts):
                 if not ts: return "N/A"
                 return datetime.fromtimestamp(ts).strftime("%Y-%m-%d")
                 
             if c_first < first_seen:
-                ch_a = {"title": c_title, "founding": c_founding, "first": fmt_date(c_first), "last": fmt_date(c_last)}
-                ch_b = {"title": event_title, "founding": t_founding, "first": fmt_date(first_seen), "last": fmt_date(last_seen)}
+                ch_a = {"title": c_title, "scope": c_scope_val, "first": fmt_date(c_first), "last": fmt_date(c_last)}
+                ch_b = {"title": event_title, "scope": t_scope_val, "first": fmt_date(first_seen), "last": fmt_date(last_seen)}
             else:
-                ch_a = {"title": event_title, "founding": t_founding, "first": fmt_date(first_seen), "last": fmt_date(last_seen)}
-                ch_b = {"title": c_title, "founding": c_founding, "first": fmt_date(c_first), "last": fmt_date(c_last)}
+                ch_a = {"title": event_title, "scope": t_scope_val, "first": fmt_date(first_seen), "last": fmt_date(last_seen)}
+                ch_b = {"title": c_title, "scope": c_scope_val, "first": fmt_date(c_first), "last": fmt_date(c_last)}
                 
             prompt = saga_check_prompt_template.format(
                 a_title=ch_a["title"],
-                a_founding_milestone=ch_a["founding"],
+                a_scope=ch_a["scope"],
                 a_first_seen=ch_a["first"],
                 a_last_seen=ch_a["last"],
                 b_title=ch_b["title"],
-                b_founding_milestone=ch_b["founding"],
+                b_scope=ch_b["scope"],
                 b_first_seen=ch_b["first"],
                 b_last_seen=ch_b["last"]
             )
@@ -228,14 +256,16 @@ def get_closure_decisions(cursor, llm_9b, event_id, closure_audit_prompt_templat
     article_count = cursor.fetchone()[0]
     
     if article_count > 2:
-        cursor.execute("SELECT title, first_seen, last_seen, entity_keys FROM events WHERE id = ?", (event_id,))
+        cursor.execute("SELECT title, first_seen, last_seen, entity_keys, scope FROM events WHERE id = ?", (event_id,))
         ev_row = cursor.fetchone()
         event_title = ev_row[0] or "Untitled Event"
         first_seen = ev_row[1] or 0
         last_seen = ev_row[2] or 0
         entity_keys = json.loads(ev_row[3]) if ev_row[3] else []
+        event_scope = ev_row[4]
         
         founding_milestone = get_founding_milestone(cursor, event_id)
+        scope_val = event_scope or founding_milestone
         
         cursor.execute("""
             SELECT ea.article_id, ea.milestone, a.title, a.rephrased_title
@@ -251,7 +281,7 @@ def get_closure_decisions(cursor, llm_9b, event_id, closure_audit_prompt_templat
             
             prompt = closure_audit_prompt_template.format(
                 event_title=event_title,
-                founding_milestone=founding_milestone,
+                scope=scope_val,
                 article_title=art_title,
                 milestone=art_milestone
             )
@@ -387,10 +417,10 @@ def do_attach_write(cursor, matched_event_id, art_id, milestone, scraped_at, new
         
     cursor.execute("INSERT OR REPLACE INTO timeline_checkpoint (id, last_article_id) VALUES (1, ?)", (art_id,))
 
-def do_create_write(cursor, art_id, art_entities, embedding, scraped_at):
+def do_create_write(cursor, art_id, art_entities, embedding, scraped_at, scope):
     cursor.execute("""
-        INSERT INTO events (title, slug, entity_keys, centroid, first_seen, last_seen, article_count, state)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO events (title, slug, entity_keys, centroid, first_seen, last_seen, article_count, state, scope)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, (
         None,
         None,
@@ -399,7 +429,8 @@ def do_create_write(cursor, art_id, art_entities, embedding, scraped_at):
         scraped_at,
         scraped_at,
         1,
-        'open'
+        'open',
+        scope
     ))
     new_ev_id = cursor.lastrowid
     
@@ -564,7 +595,7 @@ def main():
 
     # Read prompt templates if not in dry-run mode
     attach_prompt_template = ""
-    attach_adversarial_prompt_template = ""
+    event_scope_prompt_template = ""
     milestone_prompt_template = ""
     title_prompt_template = ""
     closure_audit_prompt_template = ""
@@ -572,7 +603,7 @@ def main():
     if not args.dry_run:
         try:
             attach_prompt_template = read_prompt('attach_gate')
-            attach_adversarial_prompt_template = read_prompt('attach_gate_adversarial')
+            event_scope_prompt_template = read_prompt('event_scope')
             milestone_prompt_template = read_prompt('milestone')
             title_prompt_template = read_prompt('event_title')
             closure_audit_prompt_template = read_prompt('closure_audit')
@@ -585,7 +616,7 @@ def main():
     # 4. Load Open Events into Memory
     open_events = []
     try:
-        cursor.execute("SELECT id, title, entity_keys, centroid, last_seen, article_count, first_seen FROM events WHERE state = 'open'")
+        cursor.execute("SELECT id, title, entity_keys, centroid, last_seen, article_count, first_seen, scope FROM events WHERE state = 'open'")
         event_rows = cursor.fetchall()
         for r in event_rows:
             try:
@@ -596,7 +627,8 @@ def main():
                     'centroid': np.frombuffer(r[3], dtype=np.float32),
                     'last_seen': int(r[4]) if r[4] is not None else 0,
                     'article_count': int(r[5]),
-                    'first_seen': int(r[6]) if r[6] is not None else 0
+                    'first_seen': int(r[6]) if r[6] is not None else 0,
+                    'scope': r[7]
                 })
             except Exception as ex:
                 logging.error(f"Error parsing event row {r[0]}: {ex}")
@@ -674,49 +706,43 @@ def main():
                 else:
                     event_name = best_match['title'] or "Untitled Event"
                     founding_milestone = get_founding_milestone(cursor, best_match['id'])
-
-                    # Format Vote 1 (strict editor)
-                    prompt1 = attach_prompt_template.format(
-                        event_title=event_name,
-                        founding_milestone=founding_milestone,
-                        entity_keys=", ".join(best_match['entity_keys']),
-                        new_title=reph_title,
-                        new_summary=decompressed_article[:800]
-                    )
-
-                    # Format Vote 2 (skeptical fact-checker)
-                    prompt2 = attach_adversarial_prompt_template.format(
-                        event_title=event_name,
-                        founding_milestone=founding_milestone,
-                        new_title=reph_title,
-                        new_summary=decompressed_article[:800]
-                    )
-
-                    # Invoke Gemma 9B for Vote 1
-                    output1 = llm_9b(prompt1, max_tokens=150, stop=["<end_of_turn>"], temperature=0.0)
-                    response_text1 = output1['choices'][0]['text'].strip()
-                    vote1 = "ATTACH" if response_text1.upper().startswith("ATTACH") else "REJECT"
-
-                    # Invoke Gemma 9B for Vote 2
-                    output2 = llm_9b(prompt2, max_tokens=150, stop=["<end_of_turn>"], temperature=0.0)
-                    response_text2 = output2['choices'][0]['text'].strip()
                     
-                    # Parse vote 2: last word of output. Anything other than BELONGS -> reject.
-                    tokens2 = [t.strip().upper() for t in response_text2.split() if t.strip()]
-                    vote2 = "NOT_BELONGS"
-                    if tokens2:
-                        last_token = re.sub(r'[^A-Z_]', '', tokens2[-1])
-                        if last_token == "BELONGS":
-                            vote2 = "BELONGS"
+                    # Fetch recent milestones (last 2)
+                    cursor.execute("""
+                        SELECT milestone FROM event_articles 
+                        WHERE event_id = ? AND milestone IS NOT NULL AND milestone != ''
+                        ORDER BY event_date DESC LIMIT 2
+                    """, (best_match['id'],))
+                    milestones_list = [row[0] for row in cursor.fetchall()]
+                    milestones_list.reverse()
+                    if not milestones_list:
+                        milestones_list = [founding_milestone]
+                    recent_milestones_str = "\n".join(f"- {m}" for m in milestones_list)
+                    
+                    scope_val = best_match.get('scope') or founding_milestone
 
-                    logging.info(f"Nomination: article_id={art_id}, event_id={best_match['id']}, cosine={best_sim:.4f}, vote1={vote1}, vote2={vote2} | Raw1: {response_text1} | Raw2: {response_text2}")
+                    # Format Single attach gate prompt
+                    prompt = attach_prompt_template.format(
+                        event_title=event_name,
+                        scope=scope_val,
+                        recent_milestones=recent_milestones_str,
+                        new_title=reph_title,
+                        new_summary=decompressed_article[:800]
+                    )
+
+                    # Invoke Gemma 9B for Vote
+                    output = llm_9b(prompt, max_tokens=150, stop=["<end_of_turn>"], temperature=0.0)
+                    response_text = output['choices'][0]['text'].strip()
+                    vote = "ATTACH" if response_text.upper().startswith("ATTACH") else "REJECT"
+
+                    logging.info(f"Nomination: article_id={art_id}, event_id={best_match['id']}, cosine={best_sim:.4f}, vote={vote} | Raw: {response_text}")
 
                     # Validation
-                    if vote1 == "ATTACH" and vote2 == "BELONGS":
+                    if vote == "ATTACH":
                         matched_event = best_match
-                        logging.info(f"  [ATTACH] Confirmed by both votes.")
+                        logging.info(f"  [ATTACH] Approved by scope gate.")
                     else:
-                        logging.info(f"  [REJECT] Rejected by gate. Votes: vote1={vote1}, vote2={vote2}")
+                        logging.info(f"  [REJECT] Rejected by scope gate.")
 
             # Step 3: Attach or Create Event
             if matched_event is not None:
@@ -855,11 +881,22 @@ def main():
                         'centroid': embedding,
                         'last_seen': scraped_at,
                         'article_count': 1,
-                        'first_seen': scraped_at
+                        'first_seen': scraped_at,
+                        'scope': None
                     })
                     attached_count += 1
                     logging.info(f"  [DRY-RUN] Simulated create new Event ID {new_ev_id}.")
                 else:
+                    # Generate scope charter using Gemma 9B
+                    scope = generate_event_scope(
+                        llm_9b, event_scope_prompt_template,
+                        reph_title, decompressed_article
+                    )
+                    if scope:
+                        logging.info(f"  Generated Event Scope: '{scope}'")
+                    else:
+                        logging.warning("  Failed to generate event scope. Storing NULL.")
+
                     # Write to database (transactional execution per article using hot reconnect wrapper)
                     conn, new_ev_id = run_write_burst_with_reconnect(
                         conn,
@@ -867,7 +904,8 @@ def main():
                         art_id,
                         art_entities,
                         embedding,
-                        scraped_at
+                        scraped_at,
+                        scope
                     )
                     cursor = conn.cursor()
 
@@ -879,7 +917,8 @@ def main():
                         'centroid': embedding,
                         'last_seen': scraped_at,
                         'article_count': 1,
-                        'first_seen': scraped_at
+                        'first_seen': scraped_at,
+                        'scope': scope
                     })
                     attached_count += 1
                     logging.info(f"  Created new invisible Event ID {new_ev_id}.")

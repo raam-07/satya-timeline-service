@@ -3,11 +3,11 @@ Two news event chapters. Decide whether B is a CONTINUATION of the same
 underlying saga as A, or a SIMILAR-BUT-SEPARATE story.
 
 CHAPTER A: {a_title}
-First report: {a_founding_milestone}
+Scope: {a_scope}
 Period: {a_first_seen} to {a_last_seen}
 
 CHAPTER B: {b_title}
-First report: {b_founding_milestone}
+Scope: {b_scope}
 Period: {b_first_seen} to {b_last_seen}
 
 SEPARATE if these are recurring similar events (annual budgets, different

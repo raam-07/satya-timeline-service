@@ -1,0 +1,19 @@
+<start_of_turn>user
+An EVENT is one named occurrence or process — a budget, an election, a court
+case, a scheme, a disaster, a controversy — including its reactions, analyses,
+follow-ups and consequences. An event is NOT a topic, a region, a party, or a
+rivalry between people.
+
+FIRST REPORT OF A NEW EVENT:
+TITLE: {title}
+SUMMARY: {summary}
+
+Write the scope of this event in exactly two sentences:
+1. "This event covers ..." — name the specific occurrence and state that
+   reactions, analyses and follow-up developments of it are included.
+2. "It excludes ..." — state that other actions by the same people, parties,
+   or regions are excluded unless they are developments of this occurrence.
+
+Write only the two sentences.
+<end_of_turn>
+<start_of_turn>model

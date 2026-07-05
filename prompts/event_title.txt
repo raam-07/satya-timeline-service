@@ -6,6 +6,7 @@ Rules:
 2. Factual and neutral. Describe the core subject (e.g. "Kochi Metro Phase 2 Approval" or "Pinarayi Vijayan Ration Card Controversy").
 3. Do not use teaser, clickbait, or dramatic language.
 4. Lead with the core entity/context.
+5. Never include a year unless it appears in the milestones.
 
 Milestones:
 {milestones}

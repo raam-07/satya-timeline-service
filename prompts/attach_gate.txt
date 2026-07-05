@@ -1,19 +1,22 @@
 <start_of_turn>user
-You are a strict news editor. An EVENT is one specific news story.
+An EVENT is one named occurrence or process — a budget, an election, a court
+case, a scheme, a disaster, a controversy — including its reactions, analyses,
+follow-ups and consequences. An event is NOT a topic, a region, a party, or a
+rivalry between people.
 
 EVENT TITLE: {event_title}
-THE STORY THIS EVENT IS ABOUT (its first report): {founding_milestone}
-KEY ENTITIES: {entity_keys}
+EVENT SCOPE: {scope}
+RECENT DEVELOPMENTS: {recent_milestones}
 
 NEW ARTICLE: {new_title}
 SUMMARY: {new_summary}
 
-Does the new article report a development in THIS SPECIFIC STORY?
-- REJECT if it involves the same parties or politicians but reports a DIFFERENT
-  development or controversy. Related is not the same story.
-- REJECT if it is a general roundup, digest, or campaign piece.
-- REJECT if the article is not primarily about India.
-- Bias toward REJECT. If in doubt, REJECT.
+Does the new article fall within this event's scope?
+- ATTACH if it reports a development, reaction, analysis or consequence of the
+  occurrence named in the scope — even if it differs from earlier developments.
+- REJECT if it is outside the scope: a different occurrence, a general roundup,
+  or other actions by the same people, parties or regions.
+- If in doubt, REJECT.
 
 Answer with one word: ATTACH or REJECT
 <end_of_turn>
