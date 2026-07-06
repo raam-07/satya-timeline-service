@@ -37,6 +37,11 @@ on:
         required: false
         type: boolean
         default: false
+      run_pilot:
+        description: 'Run pilot timing check'
+        required: false
+        type: boolean
+        default: false
 
 concurrency:
   group: satya-timeline-${{ github.event.inputs.audit_event_id || 'main' }}
@@ -124,6 +129,11 @@ jobs:
               if os.path.exists(temp_cache):
                   shutil.rmtree(temp_cache)
           '
+
+      - name: Run Pilot Timing Check
+        if: ${{ github.event.inputs.run_pilot == 'true' }}
+        run: |
+          python scratch/pilot_check.py
 
       - name: Run Evaluation Harness
         if: ${{ github.event.inputs.run_eval == 'true' }}
