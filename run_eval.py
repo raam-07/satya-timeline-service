@@ -66,19 +66,28 @@ def run_eval():
         expected = c["expected"]
         held_out = c.get("held_out", False)
 
-        prompt = prompt_template.format(
-            event_title=event_title,
-            scope=scope,
-            event_began=c.get("event_began", "N/A"),
-            recent_milestones=recent_milestones,
-            article_date=c.get("article_date", "N/A"),
-            new_title=article_title,
-            new_summary=article_summary[:800]
-        )
+        event_began = c.get("event_began", "N/A")
+        article_date = c.get("article_date", "N/A")
 
-        output = llm_9b(prompt, max_tokens=150, stop=["<end_of_turn>"], temperature=0.0)
-        response_text = output['choices'][0]['text'].strip()
-        predicted = "ATTACH" if response_text.upper().startswith("ATTACH") else "REJECT"
+        if event_began != "N/A" and article_date != "N/A" and article_date < event_began:
+            predicted = "REJECT"
+            stage = "date-guard"
+            print(f"[{idx+1}/{len(cases)}] Date guard triggered (article {article_date} < event {event_began}). Skipping LLM call.")
+        else:
+            prompt = prompt_template.format(
+                event_title=event_title,
+                scope=scope,
+                event_began=event_began,
+                recent_milestones=recent_milestones,
+                article_date=article_date,
+                new_title=article_title,
+                new_summary=article_summary[:800]
+            )
+
+            output = llm_9b(prompt, max_tokens=150, stop=["<end_of_turn>"], temperature=0.0)
+            response_text = output['choices'][0]['text'].strip()
+            predicted = "ATTACH" if response_text.upper().startswith("ATTACH") else "REJECT"
+            stage = "llm-gate"
 
         is_correct = (predicted == expected)
         is_junk_admit = (expected == "REJECT" and predicted == "ATTACH")
@@ -88,13 +97,14 @@ def run_eval():
             "predicted": predicted,
             "is_correct": is_correct,
             "is_junk_admit": is_junk_admit,
-            "held_out": held_out
+            "held_out": held_out,
+            "stage": stage
         })
 
         status = "✓ CORRECT" if is_correct else "✗ FAIL"
         if is_junk_admit:
             status += " (JUNK ADMIT VIOLATION)"
-        print(f"[{idx+1}/{len(cases)}] Event: {event_title} | Article: {article_title[:40]}... | Expected: {expected} | Predicted: {predicted} -> {status}")
+        print(f"[{idx+1}/{len(cases)}] Event: {event_title} | Article: {article_title[:40]}... | Expected: {expected} | Predicted: {predicted} | Stage: {stage} -> {status}")
 
     # Compute metrics
     total_tune = 0

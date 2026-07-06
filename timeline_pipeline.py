@@ -700,7 +700,9 @@ def main():
 
             matched_event = None
             if best_sim >= args.sim_threshold and best_match is not None:
-                if args.dry_run:
+                if scraped_at < best_match['first_seen']:
+                    logging.info(f"  [REJECT] Date-guard: article predates event {best_match['id']} (scraped_at {scraped_at} < first_seen {best_match['first_seen']}). Skip gate call.")
+                elif args.dry_run:
                     logging.info(f"  [DRY-RUN] Simulating Gemma 9B attach gate approval for Event ID {best_match['id']} (sim: {best_sim:.4f})")
                     matched_event = best_match
                 else:
