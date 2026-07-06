@@ -737,10 +737,19 @@ def main():
                         new_summary=decompressed_article[:800]
                     )
 
-                    # Invoke Gemma 9B for Vote
-                    output = llm_9b(prompt, max_tokens=150, stop=["<|im_end|>"], temperature=0.0)
-                    response_text = output['choices'][0]['text'].strip()
-                    vote = "ATTACH" if response_text.upper().startswith("ATTACH") else "REJECT"
+                    # Invoke gate model for Vote (reasoning-first prompt: the
+                    # verdict is the LAST ATTACH/REJECT token, not the first
+                    # word). One bad article must not crash the whole batch —
+                    # fail-safe to REJECT (new event) and keep going.
+                    try:
+                        output = llm_9b(prompt, max_tokens=350, stop=["<|im_end|>"], temperature=0.0)
+                        response_text = output['choices'][0]['text'].strip()
+                        verdict_matches = re.findall(r'\b(ATTACH|REJECT)\b', response_text.upper())
+                        vote = verdict_matches[-1] if verdict_matches else "REJECT"
+                    except Exception as gate_err:
+                        response_text = ""
+                        vote = "REJECT"
+                        logging.error(f"Gate call failed for article_id={art_id}, event_id={best_match['id']}: {type(gate_err).__name__}: {gate_err}. Defaulting to REJECT.")
 
                     logging.info(f"Nomination: article_id={art_id}, event_id={best_match['id']}, cosine={best_sim:.4f}, vote={vote} | Raw: {response_text}")
 

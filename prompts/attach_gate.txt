@@ -13,21 +13,25 @@ ARTICLE DATE: {article_date}
 NEW ARTICLE: {new_title}
 SUMMARY: {new_summary}
 
+Note: the EVENT SCOPE text lists examples of what's covered — it is not an
+exhaustive checklist. If the article is clearly a development, reaction,
+preparation, or consequence connected to the named event itself, treat it as
+in scope even if it doesn't literally match one of the listed examples.
+
 Does the new article fall within this event's scope?
 Decide step by step:
-1. REJECT if the article is outside the scope: a different occurrence, a
-   general roundup, or other actions by the same people, parties or regions.
-2. REJECT if the article's headline names a different specific occurrence
-   (a trade deal, another state's budget, another court case) — shared
-   ministers, Parliament sessions, or market impact do not override this.
-3. REJECT if the article is about a different occurrence even with the same
-   people or similar economic themes. (e.g. a trade deal is not the Union
-   Budget, even if both move markets and involve the Finance Minister.)
-4. Only if none of the above apply: ATTACH if it reports a development,
-   reaction, analysis or consequence of the occurrence named in the scope —
-   even if it differs from earlier developments.
-5. If in doubt, REJECT.
+1. REJECT if the article is about a genuinely different named occurrence —
+   a different budget, a different court case, a different deal or scheme —
+   even if it shares people, ministers, dates, or market impact with this
+   event. Shared people, parties, sessions, or market impact do NOT by
+   themselves make it part of this event.
+2. Otherwise, ATTACH if the article reports any development, reaction,
+   preparation, analysis, or consequence connected to the specific
+   occurrence named in the scope — including early/pre-event coverage and
+   follow-up sub-stories — even if it differs from earlier developments.
+3. REJECT only if neither rule clearly applies.
 
-Answer with one word: ATTACH or REJECT
+Give brief step-by-step reasoning first, then on the final line answer with
+just: ATTACH or REJECT
 <|im_end|>
 <|im_start|>assistant

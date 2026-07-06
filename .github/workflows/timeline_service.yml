@@ -37,6 +37,21 @@ on:
         required: false
         type: boolean
         default: false
+      eval_start_index:
+        description: 'Eval: 0-based case index to resume from (leave blank for a fresh run)'
+        required: false
+        type: string
+        default: ''
+      eval_limit:
+        description: 'Eval: number of cases to process this run (leave blank for all remaining)'
+        required: false
+        type: string
+        default: ''
+      eval_parallel:
+        description: 'Eval: run as 2 parallel shards on separate runners instead of one sequential run'
+        required: false
+        type: boolean
+        default: false
 
 concurrency:
   group: satya-timeline-${{ github.event.inputs.audit_event_id || 'main' }}
@@ -45,7 +60,7 @@ concurrency:
 jobs:
   process_timeline:
     runs-on: ubuntu-latest
-    timeout-minutes: 300
+    timeout-minutes: 360
     permissions:
       contents: write
       actions: write
@@ -126,11 +141,77 @@ jobs:
           '
 
       - name: Run Evaluation Harness
-        if: ${{ github.event.inputs.run_eval == 'true' }}
+        if: ${{ github.event.inputs.run_eval == 'true' && github.event.inputs.eval_parallel != 'true' }}
         env:
           MODEL_GATE_PATH: "./models/Qwen2.5-14B-Instruct-Q5_K_M.gguf"
         run: |
-          python run_eval.py
+          ARGS=""
+          if [ -n "${{ github.event.inputs.eval_start_index }}" ]; then
+            ARGS="$ARGS --start-index ${{ github.event.inputs.eval_start_index }}"
+          fi
+          if [ -n "${{ github.event.inputs.eval_limit }}" ]; then
+            ARGS="$ARGS --limit ${{ github.event.inputs.eval_limit }}"
+          fi
+          python run_eval.py $ARGS
+
+      # Runs even if the eval step above times out or gets cancelled — the
+      # incremental output file (eval/eval_run_output.jsonl) is written and
+      # fsync'd after every case, so whatever completed survives here even
+      # if the job never reaches a normal finish.
+      - name: Upload eval results (even on timeout/cancel)
+        if: ${{ always() && github.event.inputs.run_eval == 'true' && github.event.inputs.eval_parallel != 'true' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: eval-run-output-${{ github.run_id }}
+          path: eval/eval_run_output.jsonl
+          if-no-files-found: warn
+          retention-days: 14
+
+      # Persist progress to the repo so the NEXT auto-triggered chunk (fresh
+      # checkout, fresh 360-min budget) can pick up exactly where this one
+      # left off. Runs even on timeout/cancel — that's the whole point.
+      - name: Checkpoint eval progress to repo
+        if: ${{ always() && github.event.inputs.run_eval == 'true' && github.event.inputs.eval_parallel != 'true' }}
+        run: |
+          if [ -f eval/eval_run_output.jsonl ]; then
+            git config user.name "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git add eval/eval_run_output.jsonl
+            if ! git diff --cached --quiet; then
+              git commit -m "chore: eval progress checkpoint (run ${{ github.run_id }})"
+              git push origin HEAD:main
+            else
+              echo "No new eval progress to commit."
+            fi
+          else
+            echo "No eval output file found — nothing to checkpoint."
+          fi
+
+      # Auto-loop: if the eval isn't finished (timed out, cancelled, or a
+      # --limit chunk completed), dispatch the next chunk automatically,
+      # resuming from wherever eval_run_output.jsonl left off. Keeps firing
+      # new 360-min-budget runs until every case is recorded.
+      - name: Continue eval if incomplete
+        if: ${{ always() && github.event.inputs.run_eval == 'true' && github.event.inputs.eval_parallel != 'true' }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TOTAL=$(python3 -c "import json; print(sum(1 for l in open('eval/eval_cases.jsonl') if l.strip()))")
+          DONE=0
+          if [ -f eval/eval_run_output.jsonl ]; then
+            DONE=$(wc -l < eval/eval_run_output.jsonl | tr -d ' ')
+          fi
+          echo "Eval progress: $DONE / $TOTAL cases recorded."
+          if [ "$DONE" -lt "$TOTAL" ]; then
+            echo "Incomplete — dispatching continuation chunk starting at index $DONE."
+            curl -X POST \
+              -H "Authorization: token $GITHUB_TOKEN" \
+              -H "Accept: application/vnd.github.v3+json" \
+              https://api.github.com/repos/${{ github.repository }}/actions/workflows/timeline_service.yml/dispatches \
+              -d "{\"ref\":\"main\",\"inputs\":{\"run_eval\":\"true\",\"run_tests\":\"false\",\"eval_start_index\":\"$DONE\"}}"
+          else
+            echo "Eval complete — all $TOTAL cases recorded, no further chunks needed."
+          fi
 
       - name: Run Timeline Pipeline
         if: ${{ github.event.inputs.run_eval != 'true' }}
@@ -188,3 +269,158 @@ jobs:
           gh issue create \
             --title "Timeline Pipeline Failure — Run #${{ github.run_number }}" \
             --body "The timeline pipeline run failed. Please review the action run logs: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+
+  # Parallel eval mode: 2 shards on 2 separate runners, each covering half
+  # the case set, each with its own full 360-min budget. Cuts wall-clock
+  # roughly in half vs the sequential auto-loop above — doesn't speed up any
+  # single LLM call, just runs two independent halves at the same time.
+  run_eval_parallel:
+    if: ${{ github.event.inputs.run_eval == 'true' && github.event.inputs.eval_parallel == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1]
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: Set up Python 3.10
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install huggingface_hub libsql
+          if [ -f requirements.txt ]; then
+            pip install -r requirements.txt
+          fi
+
+      - name: Cache LLM Models
+        id: cache-models
+        uses: actions/cache@v4
+        with:
+          path: ./models
+          key: qwen-14b-local-models-v1
+
+      - name: Download LLM Models
+        if: steps.cache-models.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p models
+          python -c '
+          import os, shutil
+          from huggingface_hub import hf_hub_download
+
+          temp_cache = "./models/.hf_cache"
+          os.makedirs(temp_cache, exist_ok=True)
+
+          model_2b = "./models/gemma-2-2b-it-Q4_K_M.gguf"
+          if not os.path.exists(model_2b):
+              print("Downloading Gemma 2B...")
+              hf_hub_download(
+                  repo_id="bartowski/gemma-2-2b-it-GGUF",
+                  filename="gemma-2-2b-it-Q4_K_M.gguf",
+                  local_dir="./models",
+                  local_dir_use_symlinks=False,
+                  cache_dir=temp_cache
+              )
+              if os.path.exists(temp_cache):
+                  shutil.rmtree(temp_cache)
+                  os.makedirs(temp_cache, exist_ok=True)
+
+          model_qwen = "./models/Qwen2.5-14B-Instruct-Q5_K_M.gguf"
+          if not os.path.exists(model_qwen):
+              print("Downloading Qwen 14B...")
+              hf_hub_download(
+                  repo_id="bartowski/Qwen2.5-14B-Instruct-GGUF",
+                  filename="Qwen2.5-14B-Instruct-Q5_K_M.gguf",
+                  local_dir="./models",
+                  local_dir_use_symlinks=False,
+                  cache_dir=temp_cache
+              )
+              if os.path.exists(temp_cache):
+                  shutil.rmtree(temp_cache)
+          '
+
+      - name: Compute this shard's case range
+        id: shard-range
+        run: |
+          python3 -c "
+          total = sum(1 for l in open('eval/eval_cases.jsonl') if l.strip())
+          shards = 2
+          shard = ${{ matrix.shard }}
+          per = -(-total // shards)  # ceil division so shards cover everything
+          start = shard * per
+          limit = max(0, min(per, total - start))
+          print(f'start={start}')
+          print(f'limit={limit}')
+          " >> "$GITHUB_OUTPUT"
+
+      - name: Run eval shard ${{ matrix.shard }}
+        env:
+          MODEL_GATE_PATH: "./models/Qwen2.5-14B-Instruct-Q5_K_M.gguf"
+        run: |
+          python run_eval.py \
+            --start-index ${{ steps.shard-range.outputs.start }} \
+            --limit ${{ steps.shard-range.outputs.limit }} \
+            --output-path eval/eval_run_output_shard${{ matrix.shard }}.jsonl
+
+      # Runs even if this shard times out or gets cancelled — whatever it
+      # completed is still useful to the merge step.
+      - name: Upload shard ${{ matrix.shard }} results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: eval-shard-${{ matrix.shard }}-${{ github.run_id }}
+          path: eval/eval_run_output_shard${{ matrix.shard }}.jsonl
+          if-no-files-found: warn
+          retention-days: 14
+
+  # Combines both shards into the single real verdict. Runs even if a shard
+  # timed out/failed (always()) so you always get a report on however much
+  # completed, and it clearly says INCOMPLETE if either shard didn't finish.
+  merge_eval_shards:
+    needs: run_eval_parallel
+    if: ${{ always() && github.event.inputs.run_eval == 'true' && github.event.inputs.eval_parallel == 'true' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: Set up Python 3.10
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Download all shard artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: eval-shard-*-${{ github.run_id }}
+          path: shard-results
+          merge-multiple: true
+
+      - name: Merge shards and print final verdict
+        run: |
+          cat shard-results/*.jsonl > eval/eval_run_output.jsonl 2>/dev/null || touch eval/eval_run_output.jsonl
+          python run_eval.py --summarize-only --output-path eval/eval_run_output.jsonl
+
+      - name: Checkpoint merged eval output to repo
+        if: always()
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add eval/eval_run_output.jsonl
+          if ! git diff --cached --quiet; then
+            git commit -m "chore: merged parallel eval results (run ${{ github.run_id }})"
+            git push origin HEAD:main
+          else
+            echo "No changes to commit."
+          fi
