@@ -154,6 +154,10 @@ def run():
         print(f"Removing temporary Qwen directory: {qwen_dir}")
         shutil.rmtree(qwen_dir)
 
+    # Restore Gemma 9B model file to ensure GHA cache remains complete
+    print("\nRestoring Gemma 9B model file to keep cached models folder complete...")
+    download_gemma()
+
     print("\n=== PILOT TIMING RESULTS ===")
     print(f"Gemma 9B Total: {gemma_total_time:.2f}s (avg {gemma_total_time/len(test_cases):.2f}s per call) | Total completion tokens: {gemma_tokens}")
     print(f"Qwen 14B Total: {qwen_total_time:.2f}s (avg {qwen_total_time/len(test_cases):.2f}s per call) | Total completion tokens: {qwen_tokens}")
