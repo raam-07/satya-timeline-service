@@ -347,7 +347,7 @@ def load_models(dry_run=False):
     encoder = SentenceTransformer('all-MiniLM-L6-v2')
 
     model_2b_path = os.environ.get('MODEL_2B_PATH', './models/gemma-2-2b-it-Q4_K_M.gguf')
-    model_9b_path = os.environ.get('MODEL_GATE_PATH') or os.environ.get('MODEL_9B_PATH', './models/Qwen2.5-14B-Instruct-Q5_K_M.gguf')
+    model_9b_path = os.environ.get('MODEL_GATE_PATH') or os.environ.get('MODEL_9B_PATH', './models/Qwen2.5-14B-Instruct-Q6_K.gguf')
 
     if not os.path.exists(model_2b_path):
         raise FileNotFoundError(f"Gemma 2B model not found at {model_2b_path}")

@@ -48,7 +48,7 @@ on:
         type: string
         default: ''
       eval_parallel:
-        description: 'Eval: run as 2 parallel shards on separate runners instead of one sequential run'
+        description: 'Eval: run as 20 parallel shards on separate runners instead of one sequential run'
         required: false
         type: boolean
         default: false
@@ -97,7 +97,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ./models
-          key: qwen-14b-local-models-v1
+          key: qwen-14b-local-models-v2-q6k
 
       - name: Download LLM Models
         if: steps.cache-models.outputs.cache-hit != 'true' && github.event.inputs.dry_run != 'true'
@@ -126,12 +126,12 @@ jobs:
                   os.makedirs(temp_cache, exist_ok=True)
               
           # Qwen 14B (for Attach Gate decision, Scope, Saga, Closure & Title creation)
-          model_qwen = "./models/Qwen2.5-14B-Instruct-Q5_K_M.gguf"
+          model_qwen = "./models/Qwen2.5-14B-Instruct-Q6_K.gguf"
           if not os.path.exists(model_qwen):
               print("Downloading Qwen 14B...")
               hf_hub_download(
                   repo_id="bartowski/Qwen2.5-14B-Instruct-GGUF",
-                  filename="Qwen2.5-14B-Instruct-Q5_K_M.gguf",
+                  filename="Qwen2.5-14B-Instruct-Q6_K.gguf",
                   local_dir="./models",
                   local_dir_use_symlinks=False,
                   cache_dir=temp_cache
@@ -143,7 +143,7 @@ jobs:
       - name: Run Evaluation Harness
         if: ${{ github.event.inputs.run_eval == 'true' && github.event.inputs.eval_parallel != 'true' }}
         env:
-          MODEL_GATE_PATH: "./models/Qwen2.5-14B-Instruct-Q5_K_M.gguf"
+          MODEL_GATE_PATH: "./models/Qwen2.5-14B-Instruct-Q6_K.gguf"
         run: |
           ARGS=""
           if [ -n "${{ github.event.inputs.eval_start_index }}" ]; then
@@ -220,7 +220,7 @@ jobs:
           SATYA_DB_URL: ${{ secrets.SATYA_DB_URL }}
           SATYA_DB_TOKEN: ${{ secrets.SATYA_DB_TOKEN }}
           MODEL_2B_PATH: "./models/gemma-2-2b-it-Q4_K_M.gguf"
-          MODEL_GATE_PATH: "./models/Qwen2.5-14B-Instruct-Q5_K_M.gguf"
+          MODEL_GATE_PATH: "./models/Qwen2.5-14B-Instruct-Q6_K.gguf"
         run: |
           ARGS=""
           if [ "${{ github.event.inputs.dry_run }}" = "true" ]; then
@@ -270,18 +270,21 @@ jobs:
             --title "Timeline Pipeline Failure — Run #${{ github.run_number }}" \
             --body "The timeline pipeline run failed. Please review the action run logs: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
 
-  # Parallel eval mode: 2 shards on 2 separate runners, each covering half
-  # the case set, each with its own full 360-min budget. Cuts wall-clock
-  # roughly in half vs the sequential auto-loop above — doesn't speed up any
-  # single LLM call, just runs two independent halves at the same time.
+  # Parallel eval mode: 20 shards on 20 separate runners, each covering
+  # ~1/20th the case set (~7-8 cases), each with its own full 360-min budget.
+  # Cuts wall-clock down to roughly the slowest single shard vs the sequential
+  # auto-loop above — doesn't speed up any single LLM call, just runs many
+  # independent slices at the same time.
   run_eval_parallel:
     if: ${{ github.event.inputs.run_eval == 'true' && github.event.inputs.eval_parallel == 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 360
+    permissions:
+      contents: write
     strategy:
       fail-fast: false
       matrix:
-        shard: [0, 1]
+        shard: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19]
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
@@ -307,7 +310,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ./models
-          key: qwen-14b-local-models-v1
+          key: qwen-14b-local-models-v2-q6k
 
       - name: Download LLM Models
         if: steps.cache-models.outputs.cache-hit != 'true'
@@ -334,12 +337,12 @@ jobs:
                   shutil.rmtree(temp_cache)
                   os.makedirs(temp_cache, exist_ok=True)
 
-          model_qwen = "./models/Qwen2.5-14B-Instruct-Q5_K_M.gguf"
+          model_qwen = "./models/Qwen2.5-14B-Instruct-Q6_K.gguf"
           if not os.path.exists(model_qwen):
               print("Downloading Qwen 14B...")
               hf_hub_download(
                   repo_id="bartowski/Qwen2.5-14B-Instruct-GGUF",
-                  filename="Qwen2.5-14B-Instruct-Q5_K_M.gguf",
+                  filename="Qwen2.5-14B-Instruct-Q6_K.gguf",
                   local_dir="./models",
                   local_dir_use_symlinks=False,
                   cache_dir=temp_cache
@@ -353,7 +356,7 @@ jobs:
         run: |
           python3 -c "
           total = sum(1 for l in open('eval/eval_cases.jsonl') if l.strip())
-          shards = 2
+          shards = 20
           shard = ${{ matrix.shard }}
           per = -(-total // shards)  # ceil division so shards cover everything
           start = shard * per
@@ -364,7 +367,7 @@ jobs:
 
       - name: Run eval shard ${{ matrix.shard }}
         env:
-          MODEL_GATE_PATH: "./models/Qwen2.5-14B-Instruct-Q5_K_M.gguf"
+          MODEL_GATE_PATH: "./models/Qwen2.5-14B-Instruct-Q6_K.gguf"
         run: |
           python run_eval.py \
             --start-index ${{ steps.shard-range.outputs.start }} \
@@ -382,13 +385,15 @@ jobs:
           if-no-files-found: warn
           retention-days: 14
 
-  # Combines both shards into the single real verdict. Runs even if a shard
+  # Combines all shards into the single real verdict. Runs even if a shard
   # timed out/failed (always()) so you always get a report on however much
-  # completed, and it clearly says INCOMPLETE if either shard didn't finish.
+  # completed, and it clearly says INCOMPLETE if any shard didn't finish.
   merge_eval_shards:
     needs: run_eval_parallel
     if: ${{ always() && github.event.inputs.run_eval == 'true' && github.event.inputs.eval_parallel == 'true' }}
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4

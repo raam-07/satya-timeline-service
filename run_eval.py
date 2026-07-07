@@ -154,9 +154,9 @@ def run_eval(start_index=0, limit=None, output_path=None):
     if not model_9b_path:
         # Check standard locations
         possible_paths = [
-            os.path.join(script_dir, "models", "Qwen2.5-14B-Instruct-Q5_K_M.gguf"),
-            os.path.join(os.path.dirname(script_dir), "models", "Qwen2.5-14B-Instruct-Q5_K_M.gguf"),
-            "./models/Qwen2.5-14B-Instruct-Q5_K_M.gguf"
+            os.path.join(script_dir, "models", "Qwen2.5-14B-Instruct-Q6_K.gguf"),
+            os.path.join(os.path.dirname(script_dir), "models", "Qwen2.5-14B-Instruct-Q6_K.gguf"),
+            "./models/Qwen2.5-14B-Instruct-Q6_K.gguf"
         ]
         for p in possible_paths:
             if os.path.exists(p):
