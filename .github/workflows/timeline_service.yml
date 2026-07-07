@@ -7,48 +7,50 @@ on:
   #   - cron: '30 */6 * * *'
   workflow_dispatch:
     inputs:
+      # --- PIPELINE (normal production run) ---
       dry_run:
-        description: 'Run in dry-run mode (no DB writes, no LLM calls)'
+        description: 'Pipeline: dry-run only — no DB writes, no LLM calls'
         required: false
         type: boolean
         default: false
       from_id:
-        description: 'Override checkpoint and start from specific article ID'
+        description: 'Pipeline: force-start from this article ID (BLANK = normal, resumes from DB checkpoint automatically)'
         required: false
         type: string
         default: ''
       limit:
-        description: 'Limit number of articles to process in this run'
+        description: 'Pipeline: max articles to process this run (0 = default batch size of 25)'
         required: false
         type: string
-        default: ''
+        default: '0'
       run_tests:
-        description: 'Run pipeline unit test suite'
+        description: 'Pipeline: run unit test suite before processing'
         required: false
         type: boolean
-        default: true
+        default: false
       audit_event_id:
-        description: 'Run closure audit calibration on a single event ID, printing KEEP/EVICT and exit without database writes'
+        description: 'Pipeline: audit ONE event ID only (prints KEEP/EVICT, no DB writes) — blank = normal run'
         required: false
         type: string
         default: ''
+      # --- EVALUATION (accuracy harness, not the real pipeline) ---
       run_eval:
-        description: 'Run evaluation harness'
+        description: 'Eval: run the accuracy eval harness INSTEAD of the pipeline'
         required: false
         type: boolean
         default: false
       eval_start_index:
-        description: 'Eval: 0-based case index to resume from (leave blank for a fresh run)'
+        description: 'Eval: case index to resume from (0 = fresh run, start at the beginning)'
         required: false
         type: string
-        default: ''
+        default: '0'
       eval_limit:
-        description: 'Eval: number of cases to process this run (leave blank for all remaining)'
+        description: 'Eval: cases to process this run (BLANK = all remaining, do not set to 0)'
         required: false
         type: string
         default: ''
       eval_parallel:
-        description: 'Eval: run as 20 parallel shards on separate runners instead of one sequential run'
+        description: 'Eval: split across 20 parallel shards instead of one sequential run'
         required: false
         type: boolean
         default: false
