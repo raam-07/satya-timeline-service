@@ -12,6 +12,10 @@ on:
         description: 'Number of shards (must match the export)'
         required: false
         default: '20'
+      shards:
+        description: 'PARTIAL stitch: comma-separated sealed shard ids (e.g. 0,1,2). Blank = full stitch of all shards. Partial skips the forward-checkpoint write.'
+        required: false
+        default: ''
       max_saga_checks:
         description: 'Cap on cross-shard saga LLM checks'
         required: false
@@ -100,8 +104,14 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          N="${{ github.event.inputs.num_shards }}"
-          for i in $(seq 0 $((N - 1))); do
+          SHARDS="${{ github.event.inputs.shards }}"
+          if [ -n "$SHARDS" ]; then
+            LIST=$(echo "$SHARDS" | tr ',' ' ')
+          else
+            N="${{ github.event.inputs.num_shards }}"
+            LIST=$(seq 0 $((N - 1)))
+          fi
+          for i in $LIST; do
             ART_ID=$(gh api "/repos/${{ github.repository }}/actions/artifacts?name=timeline-shard-$i&per_page=10" \
               --jq '[.artifacts[] | select(.expired == false)][0].id')
             if [ -z "$ART_ID" ] || [ "$ART_ID" = "null" ]; then
@@ -122,6 +132,9 @@ jobs:
         run: |
           set -euo pipefail
           ARGS="--num-shards ${{ github.event.inputs.num_shards }} --max-saga-checks ${{ github.event.inputs.max_saga_checks }}"
+          if [ -n "${{ github.event.inputs.shards }}" ]; then
+            ARGS="$ARGS --shards ${{ github.event.inputs.shards }}"
+          fi
           if [ "${{ github.event.inputs.dry_run }}" = "true" ]; then
             ARGS="$ARGS --dry-run"
           fi

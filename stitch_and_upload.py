@@ -90,9 +90,9 @@ def load_qwen():
     return Llama(model_path=path, n_ctx=2048, verbose=False)
 
 
-def verify_shards(shard_dir, num_shards):
+def verify_shards(shard_dir, shard_ids):
     paths = []
-    for k in range(num_shards):
+    for k in shard_ids:
         p = os.path.join(shard_dir, f"shard_{k}.db")
         if not os.path.exists(p):
             logging.critical(f"HARD GATE: missing shard DB: {p}")
@@ -111,7 +111,7 @@ def verify_shards(shard_dir, num_shards):
             logging.critical(f"HARD GATE: shard {k} is not sealed (done={done}, open_events={open_count}). Aborting.")
             sys.exit(1)
         paths.append(p)
-    logging.info(f"All {num_shards} shards verified sealed.")
+    logging.info(f"All {len(shard_ids)} requested shards verified sealed: {list(shard_ids)}")
     return paths
 
 
@@ -282,7 +282,7 @@ def _set_checkpoint(cursor, max_id):
     cursor.execute("INSERT OR REPLACE INTO timeline_checkpoint (id, last_article_id) VALUES (1, ?)", (max_id,))
 
 
-def upload(merged, max_id, ev_total, ea_total):
+def upload(merged, max_id, ev_total, ea_total, set_checkpoint=True):
     remote = turso_connect()
 
     logging.info("Wiping remote events / event_articles...")
@@ -305,8 +305,11 @@ def upload(merged, max_id, ev_total, ea_total):
         remote, _ = run_write_burst_with_reconnect(remote, _insert_member_rows, ea_rows[i:i + CHUNK])
         logging.info(f"Uploaded member rows: {min(i + CHUNK, len(ea_rows))}/{len(ea_rows)}")
 
-    remote, _ = run_write_burst_with_reconnect(remote, _set_checkpoint, max_id)
-    logging.info(f"Checkpoint set to max snapshot id {max_id} — daily pipeline resumes forward from here.")
+    if set_checkpoint:
+        remote, _ = run_write_burst_with_reconnect(remote, _set_checkpoint, max_id)
+        logging.info(f"Checkpoint set to max snapshot id {max_id} — daily pipeline resumes forward from here.")
+    else:
+        logging.info("Partial stitch: checkpoint NOT written (final full stitch will set it).")
 
     r_ev = remote.cursor()
     r_ev.execute("SELECT COUNT(*) FROM events")
@@ -329,6 +332,10 @@ def main():
     parser = argparse.ArgumentParser(description="Stitch sealed shard DBs, run cross-shard saga pass, upload to Turso")
     parser.add_argument('--shard-dir', type=str, default='.', help="Directory containing shard_<n>.db files")
     parser.add_argument('--num-shards', type=int, default=20)
+    parser.add_argument('--shards', type=str, default='',
+                        help="PARTIAL stitch: comma-separated shard ids to include (e.g. '0,1,2'). "
+                             "Only sealed shards allowed. Skips the forward-checkpoint write — "
+                             "that happens only on the final full stitch. Empty = all shards (full stitch).")
     parser.add_argument('--snapshot', type=str, default='./snapshot.db')
     parser.add_argument('--shards-config', type=str, default='./shards.json')
     parser.add_argument('--merged', type=str, default='./merged.db')
@@ -346,8 +353,19 @@ def main():
         cfg = json.load(f)
     max_id = int(cfg['max_id'])
 
+    # Partial vs full stitch: same merge/saga/upload path, only the shard set
+    # differs. Partial never writes the forward checkpoint (daily pipeline must
+    # not skip articles from shards that haven't been stitched yet).
+    if args.shards.strip():
+        shard_ids = sorted({int(s) for s in args.shards.split(',') if s.strip() != ''})
+        partial = True
+        logging.info(f"PARTIAL stitch of shards {shard_ids} — checkpoint write will be skipped.")
+    else:
+        shard_ids = list(range(args.num_shards))
+        partial = False
+
     # 1. VERIFY
-    shard_paths = verify_shards(args.shard_dir, args.num_shards)
+    shard_paths = verify_shards(args.shard_dir, shard_ids)
 
     # 2. MERGE
     merged, ev_total, ea_total = merge_shards(shard_paths, args.merged)
@@ -362,7 +380,7 @@ def main():
     if args.dry_run:
         logging.info("--dry-run: skipping Turso upload. merged.db is ready for inspection.")
     else:
-        upload(merged, max_id, ev_total, ea_total)
+        upload(merged, max_id, ev_total, ea_total, set_checkpoint=not partial)
 
     merged.close()
     print(f"stitch_events={ev_total}")

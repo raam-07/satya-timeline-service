@@ -29,5 +29,10 @@ falls back to founding milestone) but judge less precisely.
 
 ## Notes
 - Old timelines stay live on the site during replay; stitch swaps them in one shot
-- Entity extractor tags the word "sad" as SAD (Akali Dal) → some foreign junk
-  articles (e.g. Trump/Rob Reiner) enter timelines. Upstream classifier fix, low priority.
+- Entity extractor false-positives let foreign junk into timelines
+  (upstream classifier repo fix, NOT a timeline bug):
+  - the word "sad" → tagged as SAD (Akali Dal), e.g. Trump/Rob Reiner articles
+  - "Congress" in US context (US Congress, testimony to Congress) → tagged as
+    INC, e.g. Jack Smith testimony, Brown University shooting
+  Fix with word-boundary/context rules in entity extraction; then optionally
+  purge single-article events whose only entity was a false positive.
