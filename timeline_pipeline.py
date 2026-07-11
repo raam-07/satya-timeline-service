@@ -204,11 +204,23 @@ def generate_event_scope(llm_9b, template, title, summary):
         )
         output = llm_9b(prompt, max_tokens=150, stop=["<|im_end|>"], temperature=0.0)
         scope = output['choices'][0]['text'].strip()
-        
+
         if not scope:
             return None
+        # Qwen often numbers the two sentences ("1. This event covers... 2. It
+        # excludes...") and sometimes wraps them in quotes. Normalize instead
+        # of rejecting — the content is fine, only the decoration differs.
+        lines = []
+        for line in scope.splitlines():
+            line = line.strip()
+            line = re.sub(r'^\s*\d+[\.\)]\s*', '', line)  # strip "1." / "2)"
+            line = line.strip('"“” ')            # strip quotes
+            if line:
+                lines.append(line)
+        scope = ' '.join(lines).strip()
+
         words = scope.split()
-        if len(words) > 80:
+        if len(words) > 90:
             logging.warning(f"Scope too long ({len(words)} words): '{scope}'")
             return None
         if not scope.lower().startswith("this event covers"):
