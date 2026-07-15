@@ -11,15 +11,15 @@ on:
       num_shards:
         description: 'Number of shards (must match the export)'
         required: false
-        default: '20'
+        default: '11'
       shards:
         description: 'PARTIAL stitch: comma-separated sealed shard ids (e.g. 0,1,2). Blank = full stitch of all shards. Partial skips the forward-checkpoint write.'
         required: false
         default: ''
       max_saga_checks:
-        description: 'Cap on cross-shard saga LLM checks'
+        description: 'Cap on cross-shard saga LLM checks (~90s each; 150 ≈ 4h, fits the 350-min job timeout)'
         required: false
-        default: '4000'
+        default: '150'
 
 concurrency:
   group: timeline-stitch

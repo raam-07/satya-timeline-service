@@ -339,7 +339,8 @@ def main():
     parser.add_argument('--snapshot', type=str, default='./snapshot.db')
     parser.add_argument('--shards-config', type=str, default='./shards.json')
     parser.add_argument('--merged', type=str, default='./merged.db')
-    parser.add_argument('--max-saga-checks', type=int, default=4000)
+    parser.add_argument('--max-saga-checks', type=int, default=150,
+                        help="Cap on cross-shard saga LLM checks (~90s each; 150 ≈ 4h, fits the 350-min job timeout)")
     parser.add_argument('--dry-run', action='store_true', help="Merge + saga pass only, NO Turso upload")
     args = parser.parse_args()
 
