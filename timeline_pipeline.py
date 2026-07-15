@@ -508,6 +508,25 @@ def slugify(text):
     text = re.sub(r'[\s-]+', '-', text)
     return text
 
+def clean_title(raw):
+    """Sanitize a generated event title. Qwen sometimes appends its reasoning
+    in Chinese after the title ('...Oath Delay争议点在于...'), and spaceless CJK
+    counts as ~1 'word', slipping past the word-count check. Keep only the
+    first line, cut at the first non-Latin character, and require a sane
+    result — otherwise return None (title regenerates on a later attach)."""
+    if not raw:
+        return None
+    title = raw.strip().strip('"').strip("'").splitlines()[0]
+    # Cut at the first character outside basic Latin + common punctuation
+    m = re.search(r'[^\x20-\x7E‘’“”–—]', title)
+    if m:
+        title = title[:m.start()]
+    title = title.strip(' -–—:;,.')
+    words = title.split()
+    if len(words) < 3 or len(words) > 12:
+        return None
+    return title
+
 def run_write_burst_with_reconnect(conn, write_func, *args, **kwargs):
     max_attempts = 2
     for attempt in range(max_attempts):
@@ -1204,16 +1223,14 @@ def main():
                         
                         title_prompt = title_prompt_template.format(milestones="\n".join(f"- {m}" for m in all_ms))
                         title_out = llm_9b(title_prompt, max_tokens=60, stop=["<|im_end|>"], temperature=0.0)
-                        gen_title = title_out['choices'][0]['text'].strip().strip('"').strip("'")
-                        
-                        # Validate title length (12 words: 8 was rejecting good
-                        # titles like "Court Rules Against ED in National Herald Case")
-                        if len(gen_title.split()) <= 12:
+                        gen_title = clean_title(title_out['choices'][0]['text'])
+
+                        if gen_title:
                             event_title = gen_title
                             event_slug = slugify(event_title)
                             logging.info(f"  Generated Event Title: '{event_title}' | slug: {event_slug}")
                         else:
-                            logging.error(f"  Generated Title too long ({len(gen_title.split())} words): '{gen_title}'. Keeping NULL.")
+                            logging.error(f"  Generated Title failed sanitation: '{title_out['choices'][0]['text'][:120]}'. Keeping NULL.")
 
                     # Run Saga check at visibility (when count transitions to 2 articles and it gets a title)
                     linked_saga_event_ids = []
