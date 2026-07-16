@@ -20,6 +20,11 @@ on:
         description: 'Cap on cross-shard saga LLM checks (~90s each; 150 ≈ 4h, fits the 350-min job timeout)'
         required: false
         default: '150'
+      upload_only:
+        description: 'RECOVERY: skip merge/saga, re-upload the merged.db from the last stitch run (timeline-merged artifact)'
+        required: false
+        type: boolean
+        default: false
 
 concurrency:
   group: timeline-stitch
@@ -55,12 +60,13 @@ jobs:
       - name: Cache LLM Models
         id: cache-models
         uses: actions/cache@v4
+        if: github.event.inputs.upload_only != 'true'
         with:
           path: ./models
           key: qwen-14b-local-models-v3-q5km
 
       - name: Download LLM Models
-        if: steps.cache-models.outputs.cache-hit != 'true'
+        if: steps.cache-models.outputs.cache-hit != 'true' && github.event.inputs.upload_only != 'true'
         run: |
           mkdir -p models
           python -c '
@@ -100,6 +106,7 @@ jobs:
           rm snapshot.zip
 
       - name: Download all shard artifacts
+        if: github.event.inputs.upload_only != 'true'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -137,6 +144,9 @@ jobs:
           fi
           if [ "${{ github.event.inputs.dry_run }}" = "true" ]; then
             ARGS="$ARGS --dry-run"
+          fi
+          if [ "${{ github.event.inputs.upload_only }}" = "true" ]; then
+            ARGS="$ARGS --upload-only"
           fi
           python stitch_and_upload.py $ARGS
 

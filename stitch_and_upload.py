@@ -284,20 +284,34 @@ def _wipe_remote(cursor):
     cursor.execute("DELETE FROM events")
 
 
+# Multi-row INSERTs: one statement per ~40 rows instead of one round trip per
+# row. Over a remote Hrana connection this is the difference between a ~3 hour
+# upload (which blew the job timeout mid-write) and ~15 minutes.
+EV_COLS = 11
+EA_COLS = 4
+ROWS_PER_STMT_EV = 40   # 440 bound params per statement
+ROWS_PER_STMT_EA = 100  # 400 bound params per statement
+
 def _insert_event_rows(cursor, rows):
-    for r in rows:
-        cursor.execute("""
-            INSERT INTO events (id, title, slug, entity_keys, centroid, first_seen,
-                                last_seen, article_count, state, scope, saga_id)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, r)
+    for i in range(0, len(rows), ROWS_PER_STMT_EV):
+        batch = rows[i:i + ROWS_PER_STMT_EV]
+        placeholders = ",".join(["(" + ",".join(["?"] * EV_COLS) + ")"] * len(batch))
+        flat = [v for r in batch for v in r]
+        cursor.execute(
+            "INSERT INTO events (id, title, slug, entity_keys, centroid, first_seen, "
+            "last_seen, article_count, state, scope, saga_id) VALUES " + placeholders,
+            flat
+        )
 
 
 def _insert_member_rows(cursor, rows):
-    for r in rows:
+    for i in range(0, len(rows), ROWS_PER_STMT_EA):
+        batch = rows[i:i + ROWS_PER_STMT_EA]
+        placeholders = ",".join(["(" + ",".join(["?"] * EA_COLS) + ")"] * len(batch))
+        flat = [v for r in batch for v in r]
         cursor.execute(
-            "INSERT INTO event_articles (event_id, article_id, milestone, event_date) VALUES (?, ?, ?, ?)",
-            r
+            "INSERT INTO event_articles (event_id, article_id, milestone, event_date) VALUES " + placeholders,
+            flat
         )
 
 
@@ -365,7 +379,32 @@ def main():
     parser.add_argument('--max-saga-checks', type=int, default=150,
                         help="Cap on cross-shard saga LLM checks (~90s each; 150 ≈ 4h, fits the 350-min job timeout)")
     parser.add_argument('--dry-run', action='store_true', help="Merge + saga pass only, NO Turso upload")
+    parser.add_argument('--upload-only', action='store_true',
+                        help="Skip verify/merge/saga: upload an EXISTING merged.db (from the timeline-merged "
+                             "artifact of a previous stitch run). Recovery path for a stitch that died mid-upload.")
     args = parser.parse_args()
+
+    if args.upload_only:
+        if not os.path.exists(args.merged):
+            logging.critical(f"--upload-only requires an existing merged DB at {args.merged}")
+            sys.exit(1)
+        if not os.path.exists(args.shards_config):
+            logging.critical(f"Shards config not found: {args.shards_config} (needed for checkpoint max_id)")
+            sys.exit(1)
+        with open(args.shards_config, 'r') as f:
+            max_id = int(json.load(f)['max_id'])
+        merged = sqlite3.connect(args.merged)
+        ev_total = merged.execute("SELECT COUNT(*) FROM events").fetchone()[0]
+        ea_total = merged.execute("SELECT COUNT(*) FROM event_articles").fetchone()[0]
+        partial = bool(args.shards.strip())
+        logging.info(f"UPLOAD-ONLY: {ev_total} events, {ea_total} member rows from {args.merged} "
+                     f"(checkpoint {'skipped — partial' if partial else f'will be set to {max_id}'})")
+        upload(merged, max_id, ev_total, ea_total, set_checkpoint=not partial)
+        merged.close()
+        print(f"stitch_events={ev_total}")
+        print(f"stitch_members={ea_total}")
+        print("stitch_uploaded=true")
+        return
 
     if not os.path.exists(args.shards_config):
         logging.critical(f"Shards config not found: {args.shards_config}")
