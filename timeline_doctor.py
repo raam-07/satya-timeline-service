@@ -25,6 +25,7 @@ import sys
 import json
 import base64
 import glob
+import time
 import logging
 import argparse
 from datetime import datetime
@@ -47,6 +48,14 @@ from timeline_pipeline import (
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 SIM_THRESHOLD = 0.60
+JUDGE_BUDGET_S = 300 * 60  # stop judging cleanly at 5h (job limit 350m); the
+                           # workflow re-dispatches itself to continue, and
+                           # already-filed articles are excluded, so chunked
+                           # runs converge.
+_JUDGE_DEADLINE = time.time() + JUDGE_BUDGET_S
+
+def _out_of_time():
+    return time.time() >= _JUDGE_DEADLINE
 SIBLING_CAP = 100  # gate checks per story; ~2-4 min each. A run that hits the
                    # job timeout mid-hunt is safe to re-run: filed articles are
                    # excluded, so it resumes where it stopped.
@@ -181,6 +190,11 @@ def judge(args):
         decisions.append({'article_id': missing, 'action': 'skip', 'reason': 'article id not found in DB'})
 
     for r in rows:
+        if _out_of_time():
+            decisions.append({'article_id': 0, 'action': 'partial_stop',
+                              'reason': 'judge time budget reached — remaining articles deferred to the self-dispatched continuation run'})
+            logging.info("Time budget reached — stopping cleanly; continuation run will pick up the rest.")
+            break
         art_id = int(r[0])
         title = r[2] or r[1] or ''
         summary = decompress_text(r[3])
@@ -313,8 +327,10 @@ def hunt_story_siblings(conn, encoder, llm_9b, llm_2b, gate_tmpl, milestone_tmpl
         sim = float(np.dot(ev['centroid'], emb))
         if sim < SIM_THRESHOLD:
             continue
-        if checked >= SIBLING_CAP:
-            logging.info(f"  sibling hunt: {SIBLING_CAP}-check cap reached")
+        if checked >= SIBLING_CAP or _out_of_time():
+            out.append({'article_id': 0, 'action': 'partial_stop',
+                        'reason': 'sibling hunt stopped (cap/time) — continuation run resumes it'})
+            logging.info("  sibling hunt: cap or time budget reached — continuation run resumes")
             break
         checked += 1
         verdict, _raw = gate_verdict(llm_9b, gate_tmpl, ev, ms, title, summary, int(r[4] or 0))
@@ -369,8 +385,10 @@ def hunt_siblings(conn, encoder, llm_9b, llm_2b, gate_tmpl, milestone_tmpl, even
         sim = float(np.dot(ev['centroid'], emb))
         if sim < SIM_THRESHOLD:
             continue
-        if checked >= SIBLING_CAP:  # bound the LLM bill per event
-            logging.info(f"  sibling hunt: {SIBLING_CAP}-check cap reached")
+        if checked >= SIBLING_CAP or _out_of_time():  # bound the LLM bill per event
+            out.append({'article_id': 0, 'action': 'partial_stop',
+                        'reason': 'sibling hunt stopped (cap/time) — continuation run resumes it'})
+            logging.info("  sibling hunt: cap or time budget reached — continuation run resumes")
             break
         checked += 1
         verdict, _raw = gate_verdict(llm_9b, gate_tmpl, ev, ms, title, summary, int(r[4] or 0))

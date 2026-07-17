@@ -159,11 +159,14 @@ jobs:
           path: decisions/
           merge-multiple: true
       - name: Decisions summary
+        id: summary
         run: |
           cat decisions/*.jsonl | python -c "
-          import sys, json, collections
+          import sys, json, collections, os
           c = collections.Counter(json.loads(l)['action'] for l in sys.stdin)
-          print('DECISIONS:', dict(c))"
+          print('DECISIONS:', dict(c))
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
+              f.write('partial=' + ('true' if c.get('partial_stop') else 'false') + '\n')"
 
       - name: Apply repairs
         if: github.event.inputs.diagnose_only != 'true'
@@ -176,11 +179,26 @@ jobs:
         if: github.event.inputs.diagnose_only == 'true'
         run: echo "diagnose_only — nothing written. Decisions saved as artifacts."
 
+      # Work unfinished (time budget hit): re-dispatch OURSELVES with the same
+      # target. Filed articles are excluded next round, so chunked runs converge.
+      - name: Continue in a fresh run (time budget was hit)
+        if: github.event.inputs.diagnose_only != 'true' && steps.summary.outputs.partial == 'true'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          curl -X POST \
+            -H "Authorization: token $GITHUB_TOKEN" \
+            -H "Accept: application/vnd.github.v3+json" \
+            https://api.github.com/repos/${{ github.repository }}/actions/workflows/timeline_doctor.yml/dispatches \
+            -d '{"ref":"main","inputs":{"target":"${{ github.event.inputs.target }}"}}'
+          echo "Continuation run dispatched with the same target."
+
       # Hand the baton back: after repairs, wake the normal runner. Harmless
       # when there's nothing to do (it exits in ~a minute with has_more=false);
       # useful when a backlog is waiting — no need to wait for the evening cron.
+      # (Skipped on partial runs — the continuation run does this at the true end.)
       - name: Trigger the daily runner
-        if: github.event.inputs.diagnose_only != 'true'
+        if: github.event.inputs.diagnose_only != 'true' && steps.summary.outputs.partial != 'true'
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
