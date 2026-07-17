@@ -1,12 +1,12 @@
 name: Satya Timeline Pipeline
 
 on:
-  # Safety-net cron: if the self-redispatch chain ever breaks (transient API
-  # failure, cancelled run), this restarts the loop within 2 hours.
-  # KEEP COMMENTED until the shard replay is stitched (STEP 7) — the forward
-  # loop must not write events while the replay is rebuilding them.
-  # schedule:
-  #   - cron: '15 */2 * * *'
+  # Forward loop cadence: daily at 13:30 UTC = 19:00 IST. Each run processes
+  # everything new since the checkpoint — chaining 95-min chunks via
+  # self-redispatch until caught up — then rests until the next evening.
+  # (~90 eligible articles/day ≈ 2-3 chunks per run.)
+  schedule:
+    - cron: '30 13 * * *'
   workflow_dispatch:
     inputs:
       dry_run:

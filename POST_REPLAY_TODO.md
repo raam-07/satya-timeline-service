@@ -18,7 +18,8 @@ falls back to founding milestone) but judge less precisely.
 - [ ] Needs: Turso creds + Qwen GGUF. ~2 min per event on CPU.
 
 ## 3. Switch on the daily forward loop
-- [ ] Uncomment the `schedule:` cron block in `.github/workflows/timeline_pipeline.yml`
+- [x] Uncomment the `schedule:` cron block in `.github/workflows/timeline_pipeline.yml`
+      (set to every 2 days at 03:15 UTC — measured eligible inflow ~90/day, well within capacity)
 - [ ] Verify checkpoint: forward loop must start from the snapshot's `max_id`
       (81076) so it doesn't re-process replayed articles
 
