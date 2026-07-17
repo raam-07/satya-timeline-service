@@ -188,11 +188,13 @@ def judge(args):
         eligible = bool(r[10])
         logging.info(f"\n=== Article {art_id}: '{title[:70]}'")
 
-        if not eligible:
+        if not eligible and not args.allow_ineligible:
             decisions.append({'article_id': art_id, 'action': 'skip',
                               'reason': 'not timeline-eligible (entities/category filter)'})
             logging.info("  -> skip: not eligible")
             continue
+        if not eligible:
+            logging.info("  note: bypassing eligibility (name-mode, human-selected story)")
 
         if checkpoint and art_id > checkpoint:
             # Safe since the daily runner skips already-filed articles
@@ -215,6 +217,8 @@ def judge(args):
         if norm > 0:
             emb = emb / norm
         entities = extract_keys(r[5], r[6], r[7], r[8])
+        if args.extra_key and args.extra_key not in entities:
+            entities = list(entities) + [args.extra_key]
 
         candidates = fetch_candidate_events(conn, scraped_at)
         best, best_sim = None, -1.0
@@ -518,6 +522,10 @@ def main():
     p.add_argument('--apply', action='store_true')
     p.add_argument('--ids', type=str, default='')
     p.add_argument('--ids-file', type=str, default='')
+    p.add_argument('--allow-ineligible', action='store_true',
+                   help="Name-mode: the human named this story, so skip the entity eligibility filter")
+    p.add_argument('--extra-key', type=str, default='',
+                   help="Entity key to add to all articles/events in this run (e.g. sonam_wangchuk)")
     p.add_argument('--check-siblings', action='store_true')
     p.add_argument('--tag', type=str, default='')
     p.add_argument('--out', type=str, default='')
