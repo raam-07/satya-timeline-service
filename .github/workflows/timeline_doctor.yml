@@ -12,10 +12,6 @@ on:
         type: boolean
         default: false
 
-concurrency:
-  group: satya-pipeline-main   # never write while the daily pipeline runs
-  cancel-in-progress: false
-
 jobs:
   prepare:
     runs-on: ubuntu-latest
@@ -111,6 +107,11 @@ jobs:
     needs: judge
     runs-on: ubuntu-latest
     timeout-minutes: 120
+    # Only the WRITE step shares the daily runner's lock. Diagnosis/judging is
+    # read-only and runs in parallel with anything.
+    concurrency:
+      group: satya-pipeline-main
+      cancel-in-progress: false
     steps:
       - uses: actions/checkout@v4
         with: { ref: main }
