@@ -1,0 +1,180 @@
+name: Timeline Doctor
+
+on:
+  workflow_dispatch:
+    inputs:
+      article_ids:
+        description: 'Article IDs to diagnose/repair (comma-separated). Leave blank with find_gaps to auto-target all unattached eligible articles.'
+        required: false
+        default: ''
+      find_gaps:
+        description: 'Auto-find ALL eligible articles missing from timelines (the backlog gap)'
+        required: false
+        type: boolean
+        default: false
+      fix:
+        description: 'APPLY repairs (unticked = diagnose only, decisions saved as artifact for review)'
+        required: false
+        type: boolean
+        default: false
+      runners:
+        description: 'Parallel judge runners (max 18)'
+        required: false
+        default: '18'
+
+concurrency:
+  group: satya-pipeline-main   # never write while the daily pipeline runs
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    outputs:
+      slices: ${{ steps.split.outputs.slices }}
+    steps:
+      - uses: actions/checkout@v4
+        with: { ref: main }
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.10' }
+      - name: Resolve target articles and split
+        id: split
+        env:
+          SATYA_DB_URL: ${{ secrets.SATYA_DB_URL }}
+          SATYA_DB_TOKEN: ${{ secrets.SATYA_DB_TOKEN }}
+        run: |
+          pip -q install libsql
+          python - << 'EOF'
+          import os, json, math
+          ids_input = "${{ github.event.inputs.article_ids }}".strip()
+          find_gaps = "${{ github.event.inputs.find_gaps }}" == "true"
+          n = max(1, min(18, int("${{ github.event.inputs.runners }}" or "18")))
+
+          if ids_input:
+              ids = [int(x) for x in ids_input.replace(' ', '').split(',') if x]
+          elif find_gaps:
+              import libsql
+              conn = libsql.connect(database=os.environ['SATYA_DB_URL'], auth_token=os.environ['SATYA_DB_TOKEN'])
+              cur = conn.cursor()
+              cur.execute("SELECT last_article_id FROM timeline_checkpoint WHERE id = 1")
+              ckpt = int(cur.fetchone()[0])
+              cur.execute(f"""
+                  SELECT a.id FROM articles a
+                  WHERE a.id <= {ckpt}
+                    AND a.status IN ('classified','entity_processed','processed')
+                    AND (a.category != 'international' OR a.party_mentioned NOT IN ('[]','') OR a.ministers_mentioned NOT IN ('[]','') OR a.states_mentioned NOT IN ('[]','') OR a.cities_mentioned NOT IN ('[]',''))
+                    AND (a.ministers_mentioned != '[]' OR a.party_mentioned != '[]' OR a.civic_flag = 1)
+                    AND a.id NOT IN (SELECT article_id FROM event_articles)
+                  ORDER BY a.scraped_at
+              """)
+              ids = [int(r[0]) for r in cur.fetchall()]
+          else:
+              raise SystemExit("Provide article_ids or tick find_gaps.")
+
+          print(f"Targets: {len(ids)} articles across {n} slices")
+          n = min(n, max(1, len(ids)))  # no empty slices
+          per = math.ceil(len(ids) / n)
+          os.makedirs('slices', exist_ok=True)
+          for i in range(n):
+              with open(f'slices/slice_{i}.txt', 'w') as f:
+                  f.write('\n'.join(str(x) for x in ids[i*per:(i+1)*per]))
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
+              f.write('slices=' + json.dumps(list(range(n))) + '\n')
+          EOF
+      - uses: actions/upload-artifact@v4
+        with:
+          name: doctor-slices-${{ github.run_id }}
+          path: slices/
+          retention-days: 7
+
+  judge:
+    needs: prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    strategy:
+      max-parallel: 18
+      fail-fast: false
+      matrix:
+        slice: ${{ fromJSON(needs.prepare.outputs.slices) }}
+    steps:
+      - uses: actions/checkout@v4
+        with: { ref: main }
+      - name: Free disk space (models need ~13GB)
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.10', cache: 'pip' }
+      - name: Install dependencies
+        run: |
+          pip install huggingface_hub libsql
+          pip install -r requirements.txt
+      - name: Cache LLM Models
+        id: cache-models
+        uses: actions/cache@v4
+        with:
+          path: ./models
+          key: qwen-14b-local-models-v3-q5km
+      - name: Download LLM Models
+        if: steps.cache-models.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p models
+          python -c '
+          from huggingface_hub import hf_hub_download
+          hf_hub_download(repo_id="bartowski/gemma-2-2b-it-GGUF", filename="gemma-2-2b-it-Q4_K_M.gguf", local_dir="./models")
+          hf_hub_download(repo_id="bartowski/Qwen2.5-14B-Instruct-GGUF", filename="Qwen2.5-14B-Instruct-Q5_K_M.gguf", local_dir="./models")
+          '
+      - uses: actions/download-artifact@v4
+        with:
+          name: doctor-slices-${{ github.run_id }}
+          path: slices/
+      - name: Judge slice ${{ matrix.slice }}
+        env:
+          SATYA_DB_URL: ${{ secrets.SATYA_DB_URL }}
+          SATYA_DB_TOKEN: ${{ secrets.SATYA_DB_TOKEN }}
+          MODEL_2B_PATH: "./models/gemma-2-2b-it-Q4_K_M.gguf"
+          MODEL_GATE_PATH: "./models/Qwen2.5-14B-Instruct-Q5_K_M.gguf"
+        run: |
+          mkdir -p decisions
+          python timeline_doctor.py --judge \
+            --ids-file "slices/slice_${{ matrix.slice }}.txt" \
+            --tag "${{ matrix.slice }}" \
+            --out "decisions/decisions_${{ matrix.slice }}.jsonl"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: doctor-decisions-${{ github.run_id }}-${{ matrix.slice }}
+          path: decisions/
+          retention-days: 30
+
+  apply:
+    needs: judge
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+        with: { ref: main }
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.10', cache: 'pip' }
+      - name: Install dependencies
+        run: |
+          pip install numpy libsql
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: doctor-decisions-${{ github.run_id }}-*
+          path: decisions/
+          merge-multiple: true
+      - name: Report decisions summary
+        run: |
+          cat decisions/*.jsonl | python -c "
+          import sys, json, collections
+          c = collections.Counter(json.loads(l)['action'] for l in sys.stdin)
+          print('DECISIONS:', dict(c))"
+      - name: Apply repairs
+        if: github.event.inputs.fix == 'true'
+        env:
+          SATYA_DB_URL: ${{ secrets.SATYA_DB_URL }}
+          SATYA_DB_TOKEN: ${{ secrets.SATYA_DB_TOKEN }}
+        run: |
+          python timeline_doctor.py --apply --decisions-dir ./decisions
+      - name: Diagnose-only notice
+        if: github.event.inputs.fix != 'true'
+        run: echo "fix was unticked — decisions saved as artifacts, nothing written. Re-run with fix=true to apply."
