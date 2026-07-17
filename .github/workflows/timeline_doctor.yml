@@ -47,16 +47,17 @@ jobs:
               import libsql
               conn = libsql.connect(database=os.environ['SATYA_DB_URL'], auth_token=os.environ['SATYA_DB_TOKEN'])
               cur = conn.cursor()
-              since = int(time.time()) - 60 * 86400
               like = f"%{target}%"
+              # All-time search; if the name has more than 60 matches, keep the
+              # MOST RECENT 60, but hand them to the judges oldest-first so the
+              # story builds chronologically.
               cur.execute("""
                   SELECT id FROM articles
                   WHERE (title LIKE ? OR rephrased_title LIKE ?)
-                    AND scraped_at >= ?
                     AND status IN ('classified','entity_processed','processed')
-                  ORDER BY scraped_at ASC LIMIT 60
-              """, (like, like, since))
-              ids = [int(r[0]) for r in cur.fetchall()]
+                  ORDER BY scraped_at DESC LIMIT 60
+              """, (like, like))
+              ids = [int(r[0]) for r in cur.fetchall()][::-1]
               key = re.sub(r'[^a-z0-9]+', '_', target.lower()).strip('_')
               extra_args = f"--allow-ineligible --extra-key {key}"
               print(f"Name mode: '{target}' -> {len(ids)} article(s), entity key '{key}'")
