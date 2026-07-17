@@ -47,6 +47,9 @@ from timeline_pipeline import (
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 SIM_THRESHOLD = 0.60
+SIBLING_CAP = 100  # gate checks per story; ~2-4 min each. A run that hits the
+                   # job timeout mid-hunt is safe to re-run: filed articles are
+                   # excluded, so it resumes where it stopped.
 WINDOW_BEFORE = 2 * 86400        # candidate events may start up to 2d after the article
 WINDOW_AFTER = 21 * 86400        # ...or have been alive within 21d before it
 
@@ -306,8 +309,8 @@ def hunt_story_siblings(conn, encoder, llm_9b, llm_2b, gate_tmpl, milestone_tmpl
         sim = float(np.dot(ev['centroid'], emb))
         if sim < SIM_THRESHOLD:
             continue
-        if checked >= 15:
-            logging.info("  sibling hunt: 15-check cap reached")
+        if checked >= SIBLING_CAP:
+            logging.info(f"  sibling hunt: {SIBLING_CAP}-check cap reached")
             break
         checked += 1
         verdict, _raw = gate_verdict(llm_9b, gate_tmpl, ev, ms, title, summary, int(r[4] or 0))
@@ -362,8 +365,8 @@ def hunt_siblings(conn, encoder, llm_9b, llm_2b, gate_tmpl, milestone_tmpl, even
         sim = float(np.dot(ev['centroid'], emb))
         if sim < SIM_THRESHOLD:
             continue
-        if checked >= 15:  # bound the LLM bill per event
-            logging.info("  sibling hunt: 15-check cap reached")
+        if checked >= SIBLING_CAP:  # bound the LLM bill per event
+            logging.info(f"  sibling hunt: {SIBLING_CAP}-check cap reached")
             break
         checked += 1
         verdict, _raw = gate_verdict(llm_9b, gate_tmpl, ev, ms, title, summary, int(r[4] or 0))
