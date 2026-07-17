@@ -141,3 +141,18 @@ jobs:
       - name: Diagnose-only notice
         if: github.event.inputs.diagnose_only == 'true'
         run: echo "diagnose_only — nothing written. Decisions saved as artifacts."
+
+      # Hand the baton back: after repairs, wake the normal runner. Harmless
+      # when there's nothing to do (it exits in ~a minute with has_more=false);
+      # useful when a backlog is waiting — no need to wait for the evening cron.
+      - name: Trigger the daily runner
+        if: github.event.inputs.diagnose_only != 'true'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          curl -X POST \
+            -H "Authorization: token $GITHUB_TOKEN" \
+            -H "Accept: application/vnd.github.v3+json" \
+            https://api.github.com/repos/${{ github.repository }}/actions/workflows/timeline_pipeline.yml/dispatches \
+            -d '{"ref":"main"}'
+          echo "Daily runner dispatched."
