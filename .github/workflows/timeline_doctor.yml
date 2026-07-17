@@ -12,6 +12,10 @@ on:
         type: boolean
         default: false
 
+concurrency:
+  group: satya-pipeline-main   # strictly serial with the daily runner
+  cancel-in-progress: false
+
 jobs:
   prepare:
     runs-on: ubuntu-latest
@@ -106,12 +110,7 @@ jobs:
   apply:
     needs: judge
     runs-on: ubuntu-latest
-    timeout-minutes: 120
-    # Only the WRITE step shares the daily runner's lock. Diagnosis/judging is
-    # read-only and runs in parallel with anything.
-    concurrency:
-      group: satya-pipeline-main
-      cancel-in-progress: false
+    timeout-minutes: 180
     steps:
       - uses: actions/checkout@v4
         with: { ref: main }
@@ -131,6 +130,7 @@ jobs:
           import sys, json, collections
           c = collections.Counter(json.loads(l)['action'] for l in sys.stdin)
           print('DECISIONS:', dict(c))"
+
       - name: Apply repairs
         if: github.event.inputs.diagnose_only != 'true'
         env:
