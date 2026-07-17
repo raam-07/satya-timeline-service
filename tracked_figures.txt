@@ -2,3 +2,4 @@
 # are timeline-eligible even without entity tags. The Timeline Doctor's name
 # mode appends here automatically; you can also edit by hand.
 Sonam Wangchuk
+Wangchuk
