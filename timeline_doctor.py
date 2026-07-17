@@ -43,6 +43,7 @@ from timeline_pipeline import (
     clean_title,
     slugify,
     run_write_burst_with_reconnect,
+    numbers_grounded,
     ELIGIBILITY_SQL,
 )
 
@@ -170,7 +171,13 @@ def gen_milestone(llm_2b, milestone_tmpl, title, summary):
         out = llm_2b(milestone_tmpl.format(title=title, summary=summary[:1200]),
                      max_tokens=80, stop=["<end_of_turn>"], temperature=0.0)
         m = out['choices'][0]['text'].strip().strip('"')
-        return m if 0 < len(m.split()) <= 32 else None
+        if not (0 < len(m.split()) <= 32):
+            return None
+        grounded, bad = numbers_grounded(m, title, summary)
+        if not grounded:
+            logging.info(f"  milestone rejected: hallucinated number '{bad}' -> NULL")
+            return None
+        return m
     except Exception as e:
         logging.error(f"Milestone generation failed: {e}")
         return None
@@ -208,9 +215,41 @@ def judge(args):
     gate_tmpl = read_prompt('attach_gate')
     milestone_tmpl = read_prompt('milestone')
     scope_tmpl = read_prompt('event_scope')
+    title_tmpl = read_prompt('event_title')
 
     check_siblings = (args.check_siblings or len(ids) <= 5) and not args.skip_sibling_hunt
     decisions = []
+    reframed_events = set()   # regenerate each touched event's title/scope once
+
+    def maybe_reframe(event_id):
+        """Emit a reframe decision (new title+scope from the FULL milestone set)
+        for an existing event this run touched — fixes stale/wrong framing
+        WITHOUT touching article membership. Once per event, >=5 articles."""
+        if not event_id or event_id in reframed_events:
+            return
+        reframed_events.add(event_id)
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT COALESCE(ea.milestone, a.rephrased_title, a.title)
+            FROM event_articles ea JOIN articles a ON a.id = ea.article_id
+            WHERE ea.event_id = ? ORDER BY ea.event_date ASC
+        """, (event_id,))
+        ms = [x[0] for x in cur.fetchall() if x[0]]
+        if len(ms) < 5:
+            return
+        try:
+            out = llm_9b(title_tmpl.format(milestones="\n".join(f"- {m}" for m in ms[:20])),
+                         max_tokens=60, stop=["<|im_end|>"], temperature=0.0)
+            new_title = clean_title(out['choices'][0]['text'])
+            if not new_title:
+                return
+            new_scope = generate_event_scope(llm_9b, scope_tmpl, new_title, " ".join(ms[:8]))
+            decisions.append({'article_id': 0, 'action': 'reframe', 'event_id': event_id,
+                              'title': new_title, 'slug': slugify(new_title), 'scope': new_scope,
+                              'reason': f"re-framed from {len(ms)} milestones"})
+            logging.info(f"  [REFRAME] event {event_id} -> '{new_title}'")
+        except Exception as e:
+            logging.error(f"Reframe gen failed for event {event_id}: {e}")
 
     def fresh_conn():
         # Turso drops idle Hrana streams while Qwen thinks for minutes; a fresh
@@ -261,6 +300,7 @@ def judge(args):
             logging.info(f"  -> already in event {ev_id} '{ev_title}' ({ev_count} articles, {ev_state})")
             decisions.append({'article_id': art_id, 'action': 'report',
                               'reason': f"already in event {ev_id} '{ev_title}' ({ev_count} articles, {ev_state})"})
+            maybe_reframe(ev_id)
             evd = alias_evidence(args.extra_key, art_id, title)
             if evd:
                 decisions.append(evd)
@@ -301,6 +341,7 @@ def judge(args):
                     'embedding_b64': base64.b64encode(emb.astype(np.float32).tobytes()).decode(),
                     'reason': f"gate ATTACH to event {best['id']} (cos {best_sim:.3f})",
                 })
+                maybe_reframe(best['id'])
                 ev = alias_evidence(args.extra_key, art_id, title)
                 if ev:
                     decisions.append(ev)
@@ -475,9 +516,13 @@ def apply(args):
         sys.exit(1)
     decisions, pending, seen = [], [], set()
     alias_votes = {}
+    reframes = {}   # event_id -> latest reframe decision (dedup across slices)
     for fp in files:
         for line in open(fp):
             d = json.loads(line)
+            if d['action'] == 'reframe':
+                reframes[d['event_id']] = d
+                continue
             if d['action'] == 'alias_evidence':
                 a = d.get('alias', '')
                 if a:
@@ -586,6 +631,23 @@ def apply(args):
         conn, _ = run_write_burst_with_reconnect(conn, _apply_attach, d2, ev_row)
         applied['attach'] += 1
         logging.info(f"ATTACHED sibling {d['article_id']} -> event {ev_id}")
+
+    # Pass 3: reframe touched events (title/scope only — NEVER article membership)
+    applied['reframed'] = 0
+    for ev_id, d in reframes.items():
+        def _reframe_write(cursor, d=d, ev_id=ev_id):
+            cursor.execute("SELECT 1 FROM events WHERE id = ?", (ev_id,))
+            if not cursor.fetchone():
+                return
+            if d.get('scope'):
+                cursor.execute("UPDATE events SET title = ?, slug = ?, scope = ? WHERE id = ?",
+                               (d['title'], d['slug'], d['scope'], ev_id))
+            else:
+                cursor.execute("UPDATE events SET title = ?, slug = ? WHERE id = ?",
+                               (d['title'], d['slug'], ev_id))
+        conn, _ = run_write_burst_with_reconnect(conn, _reframe_write)
+        applied['reframed'] += 1
+        logging.info(f"REFRAMED event {ev_id} -> '{d['title']}'")
 
     logging.info(f"\nApply done: {applied}")
     print(f"doctor_attached={applied['attach']}")
