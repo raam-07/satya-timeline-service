@@ -300,6 +300,7 @@ def judge(args):
             logging.info(f"  -> already in event {ev_id} '{ev_title}' ({ev_count} articles, {ev_state})")
             decisions.append({'article_id': art_id, 'action': 'report',
                               'reason': f"already in event {ev_id} '{ev_title}' ({ev_count} articles, {ev_state})"})
+            decisions.append({'article_id': 0, 'action': 'touched_event', 'event_id': ev_id})
             maybe_reframe(ev_id)
             evd = alias_evidence(args.extra_key, art_id, title)
             if evd:
@@ -341,6 +342,7 @@ def judge(args):
                     'embedding_b64': base64.b64encode(emb.astype(np.float32).tobytes()).decode(),
                     'reason': f"gate ATTACH to event {best['id']} (cos {best_sim:.3f})",
                 })
+                decisions.append({'article_id': 0, 'action': 'touched_event', 'event_id': best['id']})
                 maybe_reframe(best['id'])
                 ev = alias_evidence(args.extra_key, art_id, title)
                 if ev:
@@ -504,9 +506,63 @@ def _apply_attach(cursor, d, ev_row):
         new_centroid = new_centroid / n
     keys = list(dict.fromkeys((json.loads(keys_json) if keys_json else []) + d.get('entities', [])))[:15]
     cursor.execute("""
-        UPDATE events SET article_count = ?, centroid = ?, entity_keys = ?, last_seen = MAX(last_seen, ?)
+        UPDATE events SET article_count = ?, centroid = ?, entity_keys = ?,
+            last_seen = MAX(last_seen, ?), state = 'open'
         WHERE id = ?
     """, (count + 1, new_centroid.astype(np.float32).tobytes(), json.dumps(keys), d['scraped_at'], ev_id))
+
+
+MERGE_COSINE_MIN = 0.80   # only merge events that are near-identical
+MERGE_SHARED_KEYS = 2
+
+def merge_duplicate_events(conn, touched_ids):
+    """Consolidate near-identical events among the ones this run touched. Only
+    merges pairs with centroid cosine >= 0.80 AND >=2 shared entity keys — a
+    high bar so genuinely distinct events (a person merely co-mentioned) are
+    never merged. Moves articles into the largest, recomputes it, deletes the
+    emptied ones. Returns the number of merges."""
+    ids = [i for i in touched_ids if i]
+    if len(ids) < 2:
+        return 0
+    cur = conn.cursor()
+    evs = {}
+    for i in ids:
+        cur.execute("SELECT id, entity_keys, centroid, article_count, first_seen, last_seen, title, slug FROM events WHERE id = ?", (i,))
+        r = cur.fetchone()
+        if r and r[2]:
+            evs[i] = {'id': r[0], 'keys': set(json.loads(r[1]) if r[1] else []),
+                      'centroid': np.frombuffer(r[2], dtype=np.float32),
+                      'count': int(r[3] or 0), 'first': int(r[4] or 0), 'last': int(r[5] or 0),
+                      'title': r[6], 'slug': r[7]}
+    merges = 0
+    remaining = set(evs.keys())
+    merged_into = {}
+    while remaining:
+        base = evs[max(remaining, key=lambda x: evs[x]['count'])]  # largest as target
+        remaining.discard(base['id'])
+        group = []
+        for other_id in list(remaining):
+            o = evs[other_id]
+            if len(base['keys'] & o['keys']) >= MERGE_SHARED_KEYS and \
+               float(np.dot(base['centroid'], o['centroid'])) >= MERGE_COSINE_MIN:
+                group.append(other_id)
+                remaining.discard(other_id)
+        for other_id in group:
+            def _merge(cursor, tgt=base['id'], src=other_id):
+                cursor.execute("UPDATE event_articles SET event_id = ? WHERE event_id = ?", (tgt, src))
+                cursor.execute("DELETE FROM events WHERE id = ?", (src,))
+                cursor.execute("SELECT COUNT(*), MIN(event_date), MAX(event_date) FROM event_articles WHERE event_id = ?", (tgt,))
+                cnt, fmin, fmax = cursor.fetchone()
+                merged_keys = json.dumps(list(base['keys'] | evs[src]['keys'])[:15])
+                now = int(datetime.now().timestamp())
+                state = 'open' if (now - int(fmax or 0)) <= 21 * 86400 else 'closed'
+                cursor.execute("UPDATE events SET article_count = ?, first_seen = ?, last_seen = ?, entity_keys = ?, state = ? WHERE id = ?",
+                               (cnt, fmin, fmax, merged_keys, state, tgt))
+            conn, _ = run_write_burst_with_reconnect(conn, _merge)
+            merged_into[other_id] = base['id']
+            merges += 1
+            logging.info(f"MERGED event {other_id} -> {base['id']} (duplicate story)")
+    return conn, merges
 
 
 def apply(args):
@@ -517,11 +573,16 @@ def apply(args):
     decisions, pending, seen = [], [], set()
     alias_votes = {}
     reframes = {}   # event_id -> latest reframe decision (dedup across slices)
+    touched = set()  # every event this run touched, for duplicate merge
     for fp in files:
         for line in open(fp):
             d = json.loads(line)
+            if d['action'] == 'touched_event':
+                touched.add(d['event_id'])
+                continue
             if d['action'] == 'reframe':
                 reframes[d['event_id']] = d
+                touched.add(d['event_id'])
                 continue
             if d['action'] == 'alias_evidence':
                 a = d.get('alias', '')
@@ -581,6 +642,7 @@ def apply(args):
             conn, _ = run_write_burst_with_reconnect(conn, _apply_attach, d, ev_row)
             applied['attach'] += 1
             anchor_events[d['article_id']] = d['event_id']
+            touched.add(d['event_id'])
             logging.info(f"ATTACHED article {d['article_id']} -> event {d['event_id']}")
         else:
             state = 'closed' if (now - d['scraped_at']) > 21 * 86400 else 'open'
@@ -602,6 +664,7 @@ def apply(args):
             conn, _ = run_write_burst_with_reconnect(conn, _member)
             founded_this_pass.append({'id': new_id, 'keys': set(d.get('entities', [])), 'centroid': emb})
             anchor_events[d['article_id']] = new_id
+            touched.add(new_id)
             applied['found'] += 1
             logging.info(f"FOUNDED event {new_id} ({state}) for article {d['article_id']}")
 
@@ -632,9 +695,17 @@ def apply(args):
         applied['attach'] += 1
         logging.info(f"ATTACHED sibling {d['article_id']} -> event {ev_id}")
 
-    # Pass 3: reframe touched events (title/scope only — NEVER article membership)
+    # Pass 3: merge duplicate events for the same story (near-identical only).
+    conn, applied['merged'] = merge_duplicate_events(conn, touched)
+
+    # Pass 4: reframe surviving events (title/scope only — NEVER membership).
     applied['reframed'] = 0
     for ev_id, d in reframes.items():
+        # skip events that were merged away (no longer exist)
+        chk = conn.cursor()
+        chk.execute("SELECT 1 FROM events WHERE id = ?", (ev_id,))
+        if not chk.fetchone():
+            continue
         def _reframe_write(cursor, d=d, ev_id=ev_id):
             cursor.execute("SELECT 1 FROM events WHERE id = ?", (ev_id,))
             if not cursor.fetchone():

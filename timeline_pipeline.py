@@ -657,10 +657,12 @@ def do_attach_write(cursor, matched_event_id, art_id, milestone, scraped_at, new
     # they must never wipe the stored values (the old unconditional write
     # nulled the slug of every event on its 3rd+ attach, hiding it from the
     # frontend).
+    # state='open': attaching an article REACTIVATES the event. A recently
+    # closed story that gets fresh news reopens instead of spawning a twin.
     cursor.execute("""
         UPDATE events
         SET centroid = ?, last_seen = ?, article_count = ?, entity_keys = ?,
-            title = COALESCE(?, title), slug = COALESCE(?, slug)
+            title = COALESCE(?, title), slug = COALESCE(?, slug), state = 'open'
         WHERE id = ?
     """, (
         new_centroid.tobytes(),
@@ -1063,10 +1065,12 @@ def main():
                 except:
                     pass
 
-            # Find and close all overdue open events
+            # Close events INACTIVE for 21+ days (last_seen), not events merely
+            # founded 21+ days ago. A story with recent news stays open and
+            # keeps growing; only genuinely dormant stories conclude.
             try:
                 cursor = conn.cursor()
-                cursor.execute("SELECT id FROM events WHERE state = 'open' AND first_seen < ?", (closure_cutoff,))
+                cursor.execute("SELECT id FROM events WHERE state = 'open' AND last_seen < ?", (closure_cutoff,))
                 events_to_close = [r[0] for r in cursor.fetchall()]
 
                 if events_to_close:
@@ -1105,11 +1109,23 @@ def main():
             except Exception as e:
                 logging.error(f"Failed to query events for closure sweep: {e}")
 
-    # 4. Load Open Events into Memory
+    # 4. Load candidate events into memory: OPEN events plus recently-active
+    # CLOSED events (last activity within the reopen window). A developing
+    # story whose event was auto-closed must be able to REOPEN and keep
+    # growing, instead of spawning a duplicate — otherwise long timelines
+    # fragment every time the 21-day clock closes a still-live story.
+    REOPEN_WINDOW = 21 * 24 * 3600
+    batch_max_sa = max((int(r[4]) for r in articles_rows if r[4] is not None), default=0)
+    closed_cutoff = batch_max_sa - REOPEN_WINDOW if batch_max_sa else 0
     open_events = []
     try:
-        cursor.execute("SELECT id, title, entity_keys, centroid, last_seen, article_count, first_seen, scope FROM events WHERE state = 'open'")
+        cursor.execute("""
+            SELECT id, title, entity_keys, centroid, last_seen, article_count, first_seen, scope, state
+            FROM events
+            WHERE state = 'open' OR (state = 'closed' AND last_seen >= ?)
+        """, (closed_cutoff,))
         event_rows = cursor.fetchall()
+        reopenable = 0
         for r in event_rows:
             try:
                 open_events.append({
@@ -1120,13 +1136,16 @@ def main():
                     'last_seen': int(r[4]) if r[4] is not None else 0,
                     'article_count': int(r[5]),
                     'first_seen': int(r[6]) if r[6] is not None else 0,
-                    'scope': r[7]
+                    'scope': r[7],
+                    'state': r[8],
                 })
+                if r[8] == 'closed':
+                    reopenable += 1
             except Exception as ex:
                 logging.error(f"Error parsing event row {r[0]}: {ex}")
-        logging.info(f"Loaded {len(open_events)} open events into memory index.")
+        logging.info(f"Loaded {len(open_events)} candidate events ({reopenable} recently-closed, reopenable).")
     except Exception as e:
-        logging.critical(f"Failed to load open events: {e}")
+        logging.critical(f"Failed to load candidate events: {e}")
         conn.close()
         sys.exit(1)
 
@@ -1170,10 +1189,13 @@ def main():
             best_match = None
             best_sim = -1.0
 
-            # Step 2: Filter candidates in memory (candidates only if state='open' and first_seen > scraped_at - 21d)
+            # Step 2: Filter candidates in memory. Candidacy keys off LAST
+            # ACTIVITY, not founding date — an event stays eligible as long as
+            # it received news within the last 21 days, so a continuously
+            # covered story grows into one long timeline instead of chaptering.
             cutoff_time = scraped_at - 21 * 24 * 3600
             for ev in open_events:
-                if ev['first_seen'] > cutoff_time:
+                if ev['last_seen'] > cutoff_time:
                     shared_keys = ev['entity_keys'].intersection(art_entities)
                     if shared_keys:
                         sim = float(np.dot(ev['centroid'], embedding))
