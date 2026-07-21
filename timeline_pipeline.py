@@ -1352,7 +1352,17 @@ def main():
                             break
                         else:
                             if attempt == MAX_RETRIES - 1:
-                                logging.info(f"  Milestone validation failed after {MAX_RETRIES} attempts. Fallback to NULL.")
+                                logging.info(f"  Milestone validation failed after {MAX_RETRIES} attempts. Falling back to 14B model.")
+                                fallback_prompt = milestone_prompt_template.format(
+                                    title=orig_title,
+                                    summary=decompressed_article[:1200]
+                                )
+                                fb_out = llm_9b(fallback_prompt, max_tokens=100, stop=["<end_of_turn>", "<|im_end|>"], temperature=0.1)
+                                fallback_milestone = fb_out['choices'][0]['text'].strip()
+                                if fallback_milestone.startswith('"') and fallback_milestone.endswith('"'):
+                                    fallback_milestone = fallback_milestone[1:-1]
+                                milestone = fallback_milestone
+                                logging.info(f"  Generated Milestone (14B Fallback): '{milestone}'")
 
                     # Calculate EMA centroid and new count
                     new_centroid = 0.7 * matched_event['centroid'] + 0.3 * embedding
