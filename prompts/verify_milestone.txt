@@ -1,0 +1,19 @@
+<start_of_turn>user
+You are a strict fact-checker. Compare the Original Summary with the Generated Milestone.
+Your job is to catch hallucinations, exaggerations, or absolute statements that are only conditional in the original text.
+
+Rules:
+1. If the milestone states something happened (e.g., "ended his strike") but the summary only says it MIGHT happen or is CONDITIONAL (e.g., "agreed to end if X happens"), you must FAIL it.
+2. If the milestone includes numbers, names, or events not present in the summary, you must FAIL it.
+3. If the milestone accurately reflects the summary without exaggerating or changing conditionals into absolutes, you must PASS it.
+4. Output exactly ONE word: PASS or FAIL.
+
+Original Summary:
+{summary}
+
+Generated Milestone:
+{milestone}
+
+Verdict:
+<end_of_turn>
+<start_of_turn>model

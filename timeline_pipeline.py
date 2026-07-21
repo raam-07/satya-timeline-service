@@ -1021,6 +1021,7 @@ def main():
             attach_prompt_template = read_prompt('attach_gate')
             event_scope_prompt_template = read_prompt('event_scope')
             milestone_prompt_template = read_prompt('milestone')
+            verify_milestone_prompt_template = read_prompt('verify_milestone')
             title_prompt_template = read_prompt('event_title')
             closure_audit_prompt_template = read_prompt('closure_audit_batch')
             saga_check_prompt_template = read_prompt('saga_check')
@@ -1311,31 +1312,47 @@ def main():
                     logging.info(f"  [DRY-RUN] Simulated attach to Event ID {matched_event['id']}. New count: {matched_event['article_count']}")
                 else:
                     milestone = None
-                    # Write Milestone using Gemma 2B
-                    prompt = milestone_prompt_template.format(
-                        title=orig_title,
-                        summary=decompressed_article[:1200]
-                    )
-                    output = llm_2b(prompt, max_tokens=100, stop=["<end_of_turn>"], temperature=0.1)
-                    gen_milestone = output['choices'][0]['text'].strip()
+                    # Write Milestone using Gemma 2B with Actor-Critic Verification Loop
+                    MAX_RETRIES = 3
+                    for attempt in range(MAX_RETRIES):
+                        prompt = milestone_prompt_template.format(
+                            title=orig_title,
+                            summary=decompressed_article[:1200]
+                        )
+                        output = llm_2b(prompt, max_tokens=100, stop=["<end_of_turn>"], temperature=0.1 + (0.15 * attempt))
+                        gen_milestone = output['choices'][0]['text'].strip()
 
-                    # Validate milestone (max 30 words, no quotes, numbers grounded)
-                    words = gen_milestone.split()
-                    valid = True
-                    if len(words) < 3 or len(words) > 30:
-                        valid = False
-                    if gen_milestone.startswith('"') or gen_milestone.endswith('"') or gen_milestone.startswith("'") or gen_milestone.endswith("'"):
-                        valid = False
-                    grounded, bad_num = numbers_grounded(gen_milestone, orig_title, decompressed_article)
-                    if not grounded:
-                        valid = False
-                        logging.info(f"  Milestone rejected: hallucinated number '{bad_num}' not in source.")
+                        # Validate milestone (max 30 words, no quotes, numbers grounded)
+                        words = gen_milestone.split()
+                        valid = True
+                        if len(words) < 3 or len(words) > 30:
+                            valid = False
+                        if gen_milestone.startswith('"') or gen_milestone.endswith('"') or gen_milestone.startswith("'") or gen_milestone.endswith("'"):
+                            valid = False
+                        grounded, bad_num = numbers_grounded(gen_milestone, orig_title, decompressed_article)
+                        if not grounded:
+                            valid = False
+                            logging.info(f"  Milestone rejected: hallucinated number '{bad_num}' not in source.")
 
-                    if valid:
-                        milestone = gen_milestone
-                        logging.info(f"  Generated Milestone: '{milestone}'")
-                    else:
-                        logging.info(f"  Milestone validation failed (length={len(words)}, text='{gen_milestone}'). Fallback to NULL.")
+                        # Verification using 2B Model (Critic)
+                        if valid:
+                            verify_prompt = verify_milestone_prompt_template.format(
+                                summary=decompressed_article[:1200],
+                                milestone=gen_milestone
+                            )
+                            verify_out = llm_2b(verify_prompt, max_tokens=10, stop=["<end_of_turn>"], temperature=0.0)
+                            verdict = verify_out['choices'][0]['text'].strip().upper()
+                            if "FAIL" in verdict:
+                                valid = False
+                                logging.info(f"  Milestone validation failed (Critic rejected Attempt {attempt+1}/{MAX_RETRIES}): '{gen_milestone}'")
+
+                        if valid:
+                            milestone = gen_milestone
+                            logging.info(f"  Generated Milestone (Attempt {attempt+1}): '{milestone}'")
+                            break
+                        else:
+                            if attempt == MAX_RETRIES - 1:
+                                logging.info(f"  Milestone validation failed after {MAX_RETRIES} attempts. Fallback to NULL.")
 
                     # Calculate EMA centroid and new count
                     new_centroid = 0.7 * matched_event['centroid'] + 0.3 * embedding
