@@ -751,6 +751,71 @@ def run_final_seal(conn, encoder, llm_9b, closure_audit_prompt_template, saga_ch
             sealed_all = False
     return conn, sealed_all
 
+def do_null_sweep_write(cursor, updates):
+    for milestone, art_id, event_id in updates:
+        cursor.execute("UPDATE event_articles SET milestone = ? WHERE article_id = ? AND event_id = ?", 
+                       (milestone, art_id, event_id))
+
+def run_null_milestone_sweep(conn, llm_9b, milestone_prompt_template, batch_size=50):
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT ea.article_id, ea.event_id, a.title, a.rephrased_article 
+        FROM event_articles ea
+        JOIN articles a ON ea.article_id = a.id
+        WHERE ea.milestone IS NULL OR ea.milestone = ''
+        ORDER BY ea.article_id DESC
+        LIMIT ?
+    """, (batch_size,))
+    rows = cursor.fetchall()
+    
+    if not rows:
+        return conn
+        
+    logging.info(f"Running NULL milestone sweep for {len(rows)} articles...")
+    updates = []
+    
+    import base64
+    import zlib
+    def decode_and_decompress(val):
+        if not val: return None
+        try:
+            b64_str = val
+            if isinstance(val, dict):
+                b64_str = val.get("base64") or val.get("value")
+            if not b64_str: return val
+            missing_padding = len(b64_str) % 4
+            if missing_padding: b64_str += '=' * (4 - missing_padding)
+            b = base64.b64decode(b64_str)
+            return zlib.decompress(b).decode('utf-8')
+        except Exception:
+            return val
+
+    for row in rows:
+        art_id, event_id, title, content_raw = row[0], row[1], row[2], row[3]
+        try:
+            content = decode_and_decompress(content_raw)
+        except Exception as e:
+            continue
+            
+        if not content:
+            continue
+            
+        prompt = milestone_prompt_template.format(
+            title=title,
+            summary=content[:1200]
+        )
+        fb_out = llm_9b(prompt, max_tokens=100, stop=["<end_of_turn>", "<|im_end|>"], temperature=0.1)
+        milestone = fb_out['choices'][0]['text'].strip()
+        if milestone.startswith('"') and milestone.endswith('"'):
+            milestone = milestone[1:-1]
+            
+        updates.append((milestone, art_id, event_id))
+        
+    if updates:
+        conn, _ = run_write_burst_with_reconnect(conn, do_null_sweep_write, updates)
+        logging.info(f"Successfully backfilled {len(updates)} NULL milestones.")
+    return conn
+
 def main():
     parser = argparse.ArgumentParser(description="Satya Timeline Service Pipeline")
     parser.add_argument('--dry-run', action='store_true', help="Run in dry-run mode without writing to DB or invoking LLMs")
@@ -1109,6 +1174,14 @@ def main():
                             logging.error(f"Failed to run closure ceremony for Event ID {ev_id}: {e}")
             except Exception as e:
                 logging.error(f"Failed to query events for closure sweep: {e}")
+
+        # Run NULL milestone backfill sweep
+        try:
+            if not args.dry_run and not SHARD_CTX:
+                logging.info("\nChecking for historical NULL milestones to backfill...")
+                conn = run_null_milestone_sweep(conn, llm_9b, milestone_prompt_template, batch_size=50)
+        except Exception as e:
+            logging.error(f"Failed to run NULL milestone sweep: {e}")
 
     # 4. Load candidate events into memory: OPEN events plus recently-active
     # CLOSED events (last activity within the reopen window). A developing
