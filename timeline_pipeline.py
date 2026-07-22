@@ -36,9 +36,21 @@ if not os.path.exists(os.path.dirname(default_db_path)):
 
 DB_PATH = os.environ.get('SATYA_DB_PATH', default_db_path)
 
+import signal
+
 # --- Shard-replay globals (empty / 0 = normal mode) ---
 SHARD_CTX = {}
 DEADLINE_TS = 0
+
+def _handle_sigterm(signum, frame):
+    global DEADLINE_TS
+    logging.warning("SIGTERM received from runner timeout — forcing immediate graceful deadline exit to preserve progress!")
+    DEADLINE_TS = 1
+
+try:
+    signal.signal(signal.SIGTERM, _handle_sigterm)
+except Exception:
+    pass
 
 # Hard cap on saga-check LLM calls per event. Articles with ubiquitous entity
 # keys (bjp, nda, big states) can match hundreds of closed events; unbounded,
@@ -756,7 +768,7 @@ def do_null_sweep_write(cursor, updates):
         cursor.execute("UPDATE event_articles SET milestone = ? WHERE article_id = ? AND event_id = ?", 
                        (milestone, art_id, event_id))
 
-def run_null_milestone_sweep(conn, llm_9b, milestone_prompt_template, batch_size=50):
+def run_null_milestone_sweep(conn, llm_2b, llm_9b, milestone_prompt_template, verify_milestone_prompt_template, batch_size=50):
     cursor = conn.cursor()
     cursor.execute("""
         SELECT ea.article_id, ea.event_id, a.title, a.rephrased_article 
@@ -791,6 +803,10 @@ def run_null_milestone_sweep(conn, llm_9b, milestone_prompt_template, batch_size
             return val
 
     for row in rows:
+        if DEADLINE_TS and time.time() >= DEADLINE_TS:
+            logging.info("Deadline reached during NULL milestone sweep — pausing sweep for next run.")
+            break
+
         art_id, event_id, title, content_raw = row[0], row[1], row[2], row[3]
         try:
             content = decode_and_decompress(content_raw)
@@ -800,16 +816,53 @@ def run_null_milestone_sweep(conn, llm_9b, milestone_prompt_template, batch_size
         if not content:
             continue
             
-        prompt = milestone_prompt_template.format(
-            title=title,
-            summary=content[:1200]
-        )
-        fb_out = llm_9b(prompt, max_tokens=100, stop=["<end_of_turn>", "<|im_end|>"], temperature=0.1)
-        milestone = fb_out['choices'][0]['text'].strip()
-        if milestone.startswith('"') and milestone.endswith('"'):
-            milestone = milestone[1:-1]
-            
-        updates.append((milestone, art_id, event_id))
+        milestone = None
+        MAX_RETRIES = 3
+        for attempt in range(MAX_RETRIES):
+            prompt = milestone_prompt_template.format(
+                title=title or '',
+                summary=content[:1200]
+            )
+            output = llm_2b(prompt, max_tokens=100, stop=["<end_of_turn>"], temperature=0.1 + (0.15 * attempt))
+            gen_milestone = output['choices'][0]['text'].strip()
+
+            words = gen_milestone.split()
+            valid = True
+            if len(words) < 3 or len(words) > 30:
+                valid = False
+            if gen_milestone.startswith('"') or gen_milestone.endswith('"') or gen_milestone.startswith("'") or gen_milestone.endswith("'"):
+                valid = False
+            grounded, bad_num = numbers_grounded(gen_milestone, title or '', content)
+            if not grounded:
+                valid = False
+
+            if valid and verify_milestone_prompt_template:
+                verify_prompt = verify_milestone_prompt_template.format(
+                    summary=content[:1200],
+                    milestone=gen_milestone
+                )
+                verify_out = llm_2b(verify_prompt, max_tokens=10, stop=["<end_of_turn>"], temperature=0.0)
+                verdict = verify_out['choices'][0]['text'].strip().upper()
+                if "FAIL" in verdict:
+                    valid = False
+
+            if valid:
+                milestone = gen_milestone
+                break
+            else:
+                if attempt == MAX_RETRIES - 1:
+                    fallback_prompt = milestone_prompt_template.format(
+                        title=title or '',
+                        summary=content[:1200]
+                    )
+                    fb_out = llm_9b(fallback_prompt, max_tokens=100, stop=["<end_of_turn>", "<|im_end|>"], temperature=0.1)
+                    fallback_milestone = fb_out['choices'][0]['text'].strip()
+                    if fallback_milestone.startswith('"') and fallback_milestone.endswith('"'):
+                        fallback_milestone = fallback_milestone[1:-1]
+                    milestone = fallback_milestone
+
+        if milestone:
+            updates.append((milestone, art_id, event_id))
         
     if updates:
         conn, _ = run_write_burst_with_reconnect(conn, do_null_sweep_write, updates)
@@ -828,11 +881,20 @@ def main():
     parser.add_argument('--snapshot', type=str, default='./snapshot.db', help="Path to the local articles snapshot DB (shard mode)")
     parser.add_argument('--shards-config', type=str, default='./shards.json', help="Path to shards.json produced by export_snapshot.py (shard mode)")
     parser.add_argument('--deadline-ts', type=int, default=0, help="Unix timestamp; stop cleanly (between articles/closures) once passed. 0 = no deadline")
+    parser.add_argument('--max-runtime-minutes', type=int, default=130, help="Max runtime in minutes before soft deadline stop (default: 130 mins)")
     parser.add_argument('--reset-events', action='store_true', help="DANGER: wipe events, event_articles and timeline_checkpoint, then replay every article from ID 0. Full coverage rebuild.")
     args = parser.parse_args()
 
+    start_time = time.time()
+    internal_deadline = int(start_time + (args.max_runtime_minutes * 60))
+
     global DEADLINE_TS
-    DEADLINE_TS = args.deadline_ts or 0
+    if args.deadline_ts and args.deadline_ts > 0:
+        DEADLINE_TS = min(args.deadline_ts, internal_deadline)
+    else:
+        DEADLINE_TS = internal_deadline
+
+    logging.info(f"Internal runtime timer active: soft deadline set for {datetime.fromtimestamp(DEADLINE_TS).strftime('%H:%M:%S UTC')} (max {args.max_runtime_minutes} mins).")
 
     if args.shard is not None:
         if args.from_id is not None:
@@ -1179,7 +1241,7 @@ def main():
         try:
             if not args.dry_run and not SHARD_CTX:
                 logging.info("\nChecking for historical NULL milestones to backfill...")
-                conn = run_null_milestone_sweep(conn, llm_9b, milestone_prompt_template, batch_size=50)
+                conn = run_null_milestone_sweep(conn, llm_2b, llm_9b, milestone_prompt_template, verify_milestone_prompt_template, batch_size=50)
         except Exception as e:
             logging.error(f"Failed to run NULL milestone sweep: {e}")
 

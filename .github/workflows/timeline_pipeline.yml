@@ -27,9 +27,9 @@ concurrency:
 jobs:
   process_timeline:
     runs-on: ubuntu-latest
-    # Small-chunk mode: the pipeline gets a 95-min soft deadline (stops cleanly
-    # between articles); 130 hard timeout covers model download + one slow article.
-    timeout-minutes: 130
+    # Small-chunk mode: the pipeline gets a 130-min soft deadline (stops cleanly
+    # between articles); 170 hard timeout covers model download + buffer.
+    timeout-minutes: 170
     permissions:
       contents: write
       actions: write
@@ -126,9 +126,9 @@ jobs:
             ARGS="$ARGS --reset-events"
           fi
 
-          # Soft deadline: stop cleanly 95 min from now; big batch so the
+          # Soft deadline: stop cleanly 130 min from now; big batch so the
           # deadline (not the batch size) is what ends the chunk.
-          DEADLINE=$(( $(date +%s) + 95*60 ))
+          DEADLINE=$(( $(date +%s) + 130*60 ))
           ARGS="$ARGS --deadline-ts $DEADLINE --batch-size 200"
 
           # Execute pipeline and capture outputs
